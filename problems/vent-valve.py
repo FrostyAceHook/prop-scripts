@@ -1,142 +1,180 @@
-from math import pi, sqrt
-import numpy as np
-import matplotlib.pyplot as plt
+"""
+Spring-return vent valve.
+  opens  : tank pressure under the seat, spring
+  closes : pneumatic pressure on the piston
+  resists: o-ring friction
+"""
 
+from math import pi, sqrt, exp, inf, nan
 
 # Hack-in the utility module.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utility"))
 
-from oring import PistonSeal, RodSeal
 import travel
+import units as u
+from oring import PistonSeal, RodSeal
+from system import System, calc, derived
 
 
-m = 0.01936269 + 0.0089/3 # [kg] moving mass (plunger + piston + ~1/3 spring mass)
+SQRT2 = sqrt(2)
 
-pressure = lambda P, D: P*pi/4*D**2
+def circ_area(D):
+    return pi/4 * D*D
+def circ_area_to_D(A):
+    return sqrt(A*4/pi)
+def circ_perim(D):
+    return pi*D
+def circ_perim_to_D(p):
+    return p/pi
 
-# bottom-side.
-P_tank = 3.5e6 # [Pa]
-x_tank = 0.5e-3 # [m] lift over which tank-pressure area grows from seat to full bore
-F_tank_open = pressure(P_tank, 8e-3) # [N]
-F_tank_closed = pressure(P_tank, 8e-3/sqrt(2)) # [N]
-def F_tank_x(x):
-    # tank force ramps from seat area to full bore area over the first x_seal of lift
-    s = min(max(x / x_tank, 0.0), 1.0)
-    return F_tank_closed + s*(F_tank_open - F_tank_closed)
+def frustum_area(h, D1, D2):
+    return pi/2*(D1 + D2)*sqrt(h*h + (D1 - D2)**2/4)
 
-# top-side.
-D_pneumo = 31.5e-3 # [m]
-P_pneumo = 1e6 # [Pa]
-F_pneumo = pressure(P_pneumo, D_pneumo) # [N]
-tau_pneumo_venting = 5e-3 # [s] pneumatic vent time constant
-tau_pneumo_filling = 5e-3 # [s] pneumatic fill time constant
-def F_pneumo_venting_t(t):
-    return F_pneumo * np.exp(-t / tau_pneumo_venting)
-def F_pneumo_filling_t(t):
-    return F_pneumo * (1 - np.exp(-t / tau_pneumo_filling))
 
-# spring
-ell_relaxed = 25e-3 # [m]
-ell_open = 18.2e-3 # [m]
-stroke = 5e-3 # [m]
-ell_closed = ell_open - stroke # [m]
-k = 25.5e3 # [N/m]
-# x=0 is closed, x=stroke is open.
-def F_spring_x(x):
-    # spring extends as the valve opens: ell goes from ell_closed to ell_open
-    return k * (ell_relaxed - (ell_closed + x))
-F_spring_open = F_spring_x(0) # [N]
-F_spring_closed = F_spring_x(stroke) # [N]
+class VentValve(System):
+    # --- movement ---
+    stroke: u.mm
 
-F_oring_static = 237.0 # [N]
-F_oring_sliding = 89.0 # [N]
+    # --- tank side: opening ---
+    Pmin_tank: u.bar
+    Pmax_tank: u.bar
+    D_ball: u.mm
+    D_seat = derived(u.mm, "D_ball", lambda x: x/SQRT2, lambda x: x*SQRT2)
+    A_seat = derived(u.mm2, "D_seat", circ_area, circ_area_to_D)
+    A_ball = derived(u.mm2, "D_ball", circ_area, circ_area_to_D)
+    Fmin_tank_open = calc(u.N,
+        lambda s: s.Pmin_tank*s.A_ball,
+        lambda s, F: dict(A_ball=F/s.Pmin_tank))
+    Fmax_tank_open = calc(u.N,
+        lambda s: s.Pmax_tank*s.A_ball,
+        lambda s, F: dict(A_ball=F/s.Pmax_tank))
+    Fmin_tank_closed = calc(u.N,
+        lambda s: s.Pmin_tank*s.A_seat,
+        lambda s, F: dict(A_seat=F/s.Pmin_tank))
+    Fmax_tank_closed = calc(u.N,
+        lambda s: s.Pmax_tank*s.A_seat,
+        lambda s, F: dict(A_seat=F/s.Pmax_tank))
 
-oring_pneumo = PistonSeal("Pneumo side",
-        oring_ID=28.0e-3, oring_CS=2.0e-3,
-        gland_ID=28.5e-3, gland_OD=31.5e-3, gland_Lz=3e-3,
-        DP=30e5,
-        material="FKM", hardness=75, lubricated=True)
-oring_n2o = RodSeal("N2O side",
-        oring_ID=7.5e-3, oring_CS=2.0e-3,
-        gland_ID=7.9e-3, gland_OD=10.9e-3, gland_Lz=3e-3,
-        DP=70e5,
-        material="FKM", hardness=75, lubricated=True)
+    # --- past-seal flow ---
+    D_bore: u.mm
+    A_flow_cone = calc(u.mm2,
+        lambda s: frustum_area(s.stroke/2, s.D_seat + s.stroke, s.D_seat),
+        lambda s, A: dict(stroke=sqrt(s.D_seat**2 + 2*SQRT2*A/pi) - s.D_seat))
+    A_flow_bore = calc(u.mm2,
+        lambda s: circ_area(s.D_bore) - circ_area(s.D_ball),
+        lambda s, A: dict(D_bore=circ_area_to_D(A + circ_area(s.D_ball))))
+    D_flow_cone = derived(u.mm, "A_flow_cone", circ_area_to_D, circ_area)
+    D_flow_bore = derived(u.mm, "A_flow_bore", circ_area_to_D, circ_area)
 
+    # --- pneumo side: closing ---
+    P_pneumo: u.bar
+    D_pneumo: u.mm
+    A_pneumo = derived(u.mm2, "D_pneumo", circ_area, circ_area_to_D)
+    F_pneumo = calc(u.N,
+        lambda s: s.P_pneumo*s.A_pneumo,
+        lambda s, F: dict(A_pneumo=F/s.P_pneumo))
+
+    # --- spring: opening ---
+    k_spring: u.N_mm
+    ell_relaxed: u.mm # Free length.
+    ell_solid: u.mm # "Solid" length (for utilisation calc).
+    ell_open: u.mm # Installed length with the valve open.
+    ell_closed = calc(u.mm, # Installed length with the valve closed. Modifies
+                            # stroke if set.
+        lambda s: s.ell_open - s.stroke,
+        lambda s, ell: dict(stroke=s.ell_open - ell))
+    def F_spring(self, x):
+        return max(0.0,
+            self.k_spring * (self.ell_relaxed - (self.ell_closed + x)))
+    F_spring_open = calc(u.N,
+        lambda s: s.F_spring(s.stroke),
+        lambda s, F: dict(ell_open=s.ell_relaxed - F / s.k_spring))
+    F_spring_closed = calc(u.N,
+        lambda s: s.F_spring(0.0),
+        lambda s, F: dict(ell_closed=s.ell_relaxed - F / s.k_spring))
+    spring_utilisation = calc(u.percent, # Fraction of available deflection used
+                                         # when closed (keep below ~0.85).
+        lambda s: (s.ell_relaxed - s.ell_closed) / (s.ell_relaxed - s.ell_solid))
+
+
+    # --- friction ---
+    orings: tuple # List of o-rings.
+    F_fric_running = calc(u.N, # Net sliding friction.
+        lambda s: sum(o.F_friction_running() for o in s.orings))
+    F_fric_breakaway = calc(u.N, # Net static friction.
+        lambda s: sum(o.F_friction_breakaway() for o in s.orings))
+
+
+    # --- force balances (+ve margin = works) ---
+    @staticmethod
+    def excess(drive, oppose):
+        """ Fractional excess of drive over oppose (safety factor - 1). """
+        return drive / oppose - 1 if oppose > 0 else float("inf")
+
+    margin_hold_open = calc(u.N,
+        lambda s: s.F_spring_open)
+    rmargin_hold_open = calc(u.percent,
+        lambda s: (s.F_spring_open + s.F_fric_breakaway) / s.F_pneumo)
+
+    margin_hold_closed = calc(u.N,
+        lambda s: s.F_pneumo - s.Fmax_tank_closed - s.F_spring_closed)
+    rmargin_hold_closed = calc(u.percent,
+        lambda s: s.excess(s.F_pneumo, s.Fmax_tank_closed + s.F_spring_closed))
+
+    margin_close = calc(u.N,
+        lambda s: s.F_pneumo - s.Fmax_tank_open - max(
+            s.F_spring_open + s.F_fric_breakaway,
+            s.F_spring_closed + s.F_fric_running
+        ))
+    rmargin_close = calc(u.percent,
+        lambda s: s.excess(s.F_pneumo, s.Fmax_tank_open + max(
+            s.F_spring_open + s.F_fric_breakaway,
+            s.F_spring_closed + s.F_fric_running
+        )))
+
+    margin_open = calc(u.N,
+        lambda s: min(
+            s.Fmin_tank_closed + s.F_spring_closed - s.F_fric_breakaway,
+            s.Fmin_tank_open + s.F_spring_open - s.F_fric_running
+        ))
+    rmargin_open = calc(u.percent,
+        lambda s: min(
+            s.excess(s.Fmin_tank_closed + s.F_spring_closed, s.F_fric_breakaway),
+            s.excess(s.Fmin_tank_open + s.F_spring_open, s.F_fric_running)
+        ))
+
+
+
+def baseline():
+    return VentValve(
+        stroke=1.5e-3,
+        Pmin_tank=0.0, Pmax_tank=1.25*70e5, D_ball=6e-3, # +25% tank actual.
+        D_bore=7.2e-3,
+        P_pneumo=10e5/1.25, D_pneumo=31.5e-3, # -25% pneumo actual.
+        k_spring=25.5e3, ell_relaxed=25e-3, ell_open=18.2e-3, ell_solid=12.5e-3,
+        orings=(
+            # NOTE: seal DP values are not dynamically updated.
+            PistonSeal("Pneumo side",
+                    oring_ID=28.0e-3, oring_CS=2.0e-3,
+                    gland_ID=28.5e-3, gland_OD=31.5e-3, gland_Lz=3e-3,
+                    DP=30e5, material="FKM", hardness=75, lubricated=True),
+            RodSeal("N2O side",
+                    oring_ID=7.5e-3, oring_CS=2.0e-3,
+                    gland_ID=7.9e-3, gland_OD=10.9e-3, gland_Lz=3e-3,
+                    DP=70e5, material="FKM", hardness=75, lubricated=True),
+        ),
+    )
 
 
 def main():
-    print(f"F_pneumo: {F_pneumo}")
-    print(f"F_tank_open: {F_tank_open}")
-    print(f"F_tank_closed: {F_tank_closed}")
-    print(f"F_spring_open: {F_spring_open}")
-    print(f"F_spring_closed: {F_spring_closed}")
-    print(f"F_oring_static: {F_oring_static}")
-    print(f"F_oring_sliding: {F_oring_sliding}")
+    valve = baseline()
+    valve = valve.tweak(k_spring=80e3)
+    valve = valve.tweak(F_pneumo=1200)
+    valve = valve.tweak(F_spring_open=400)
+    valve.report()
 
-    # valve open static:
-    #  +tank pressure
-    #  +spring
-    print("valve open static:")
-    print(f" {F_tank_open + F_spring_open}")
-    # valve closed static:
-    #  -tank pressure
-    #  -spring
-    #  +pneumo pressure
-    print("valve closed static:")
-    print(f" {-F_tank_closed - F_spring_closed + F_pneumo}")
-    # valve open, lets close:
-    #  -tank pressure
-    #  -spring
-    #  -oring friction
-    #  +pneumo pressure
-    #  -ice??
-    print("valve open, let's close:")
-    print(f" {-F_tank_open - F_spring_open - F_oring_sliding + F_pneumo}")
-    # valve closed, lets open:
-    #  +tank pressure
-    #  +spring
-    #  -oring friction
-    #  -ice??
-    print("valve closed, let's open:")
-    print(f" {F_tank_closed + F_spring_closed - F_oring_sliding}")
-
-
-    def oring_friction(t, x, v):
-        if v == 0:
-            return oring_pneumo.F_friction_breakaway() \
-                 + oring_n2o.F_friction_breakaway()
-        return oring_pneumo.F_friction_running() \
-                + oring_n2o.F_friction_running()
-
-    opening = travel.travel(
-        {
-            "tank": lambda t, x, v: F_tank_x(x),
-            "spring": lambda t, x, v: F_spring_x(x),
-            "pneumatic": lambda t, x, v: -F_pneumo_venting_t(t),
-            "o-ring": travel.Friction(oring_friction),
-        },
-        mass=m, x0=0.0, x_min=0.0, x_max=stroke,
-        dt=2e-6, t_end=0.1, t_after_impact=0, title="Valve opening",
-    )
-
-    closing = travel.travel(
-        {
-            "tank": lambda t, x, v: F_tank_x(x),
-            "spring": lambda t, x, v: F_spring_x(x),
-            "pneumatic": lambda t, x, v: -F_pneumo_filling_t(t),
-            "o-ring": travel.Friction(oring_friction),
-        },
-        mass=m, x0=stroke, x_min=0.0, x_max=stroke,
-        dt=2e-6, t_end=0.1, t_after_impact=0, title="Valve closing",
-    )
-
-    print(opening)
-    print(closing)
-    opening.plot()
-    closing.plot()
-    plt.show()
 
 if __name__ == "__main__":
     main()
