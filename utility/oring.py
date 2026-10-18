@@ -15,6 +15,7 @@ __all__ = (
     "RodSeal",
     "InternalFaceSeal",
     "ExternalFaceSeal",
+    "OringFriction",
 )
 
 
@@ -41,6 +42,9 @@ FRICTION = {
                      "breakaway": (0.20, 0.35, 0.50)},
 }
 LOW, NOM, HIGH = 0, 1, 2
+class OringFriction: # exported on import *.
+    LOW, NOM, HIGH = 0, 1, 2
+
 
 
 def _shift_gland(s, MD):

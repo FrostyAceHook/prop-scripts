@@ -1,18 +1,20 @@
 """
-Spring-return vent valve.
+Normally-open spring-return pneumatically-closed vent valve.
   opens  : tank pressure under the seat, spring
-  closes : pneumatic pressure on the piston
+  closes : pneumatic pressure on the plunger
   resists: o-ring friction
 """
 
-from math import pi, sqrt, exp, inf, nan
+from math import pi, sqrt, exp, inf, nan, isnan
 import matplotlib.pyplot as plt
+import numpy as np
 
 # Hack-in the utility module.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utility"))
 
+import search
 import units as u
 from fmt import style_ax
 from oring import *
@@ -38,6 +40,14 @@ def calc_circ_D(name):
     return derived(u.mm, name, circ_area_to_D, circ_area)
 def calc_circ_A(name):
     return derived(u.mm2, name, circ_area, circ_area_to_D)
+
+def _value(x, default):
+    """ `x`, or `default` if it's None. """
+    return default if x is None else x
+def _nanmax(*xs):
+    """ max(), but nan if any value is nan. """
+    return nan if any(isnan(x) for x in xs) else max(xs)
+
 
 
 class VentValve(System):
@@ -75,9 +85,8 @@ class VentValve(System):
     A_seat_bore = calc_circ_A("D_seat_bore")
     D_plunger_bore: u.mm
     A_plunger_bore = calc(u.mm2,
-        lambda s: circ_area(s.D_plunger_bore) - circ_area(s.D_ball),
-        lambda s, A: dict(D_plunger_bore=
-            circ_area_to_D(A + circ_area(s.D_ball))))
+        lambda s: circ_area(s.D_plunger_bore) - s.A_ball,
+        lambda s, A: dict(D_plunger_bore=circ_area_to_D(A + s.A_ball)))
     D_seat_cone = calc_circ_D("A_seat_cone")
     A_seat_cone = calc(u.mm2,
         lambda s: frustum_area(s.stroke/2, s.D_seat + s.stroke, s.D_seat),
@@ -94,7 +103,6 @@ class VentValve(System):
     # --- spring: opening ---
     k_spring: u.N_mm
     ell_relaxed: u.mm # Free length.
-    ell_solid: u.mm # "Solid" length (for utilisation calc).
     ell_open: u.mm # Installed length with the valve open.
     ell_closed = calc(u.mm, # Installed length with the valve closed. Modifies
                             # stroke if set.
@@ -109,9 +117,11 @@ class VentValve(System):
     F_spring_closed = calc(u.N,
         lambda s: s.F_spring(0.0),
         lambda s, F: dict(ell_closed=s.ell_relaxed - F / s.k_spring))
-    spring_utilisation = calc(u.percent, # Fraction of available deflection used
-                                         # when closed (keep below ~0.85).
-        lambda s: (s.ell_relaxed - s.ell_closed) / (s.ell_relaxed - s.ell_solid))
+
+    # ell_solid: u.mm # "Solid" length (for utilisation calc).
+    # spring_utilisation = calc(u.percent, # Fraction of available deflection used
+    #                                      # when closed (keep below ~0.85).
+    #     lambda s: (s.ell_relaxed - s.ell_closed) / (s.ell_relaxed - s.ell_solid))
 
 
     # --- friction ---
@@ -161,19 +171,66 @@ class VentValve(System):
         ))
 
 
+    # --- tolerances ---
+    def tolerances(self):
+        seals = lambda level: tuple(o.tweak(friction_level=level)
+                                    for o in self.orings)
+        return {
+            "k_spring": 0.1,
+            "ell_open": (self.ell_open - 0.05e-3, self.ell_open + 0.05e-3),
+            "stroke": (self.stroke - 0.05e-3, self.stroke + 0.05e-3),
+            "P_pneumo": 0.1,
+            "Pmax_tank": 0.1,
+            "orings": (seals(OringFriction.LOW), seals(OringFriction.HIGH)),
+        }
+    worst_margin_hold_open = calc(u.N,
+        lambda s: search.corners(s, "margin_hold_open", s.tolerances()).value)
+    worst_rmargin_hold_open = calc(u.percent,
+        lambda s: search.corners(s, "rmargin_hold_open", s.tolerances()).value)
+    worst_margin_hold_closed = calc(u.N,
+        lambda s: search.corners(s, "margin_hold_closed", s.tolerances()).value)
+    worst_rmargin_hold_closed = calc(u.percent,
+        lambda s: search.corners(s, "rmargin_hold_closed", s.tolerances()).value)
+    worst_margin_close = calc(u.N,
+        lambda s: search.corners(s, "margin_close", s.tolerances()).value)
+    worst_rmargin_close = calc(u.percent,
+        lambda s: search.corners(s, "rmargin_close", s.tolerances()).value)
+    worst_margin_open = calc(u.N,
+        lambda s: search.corners(s, "margin_open", s.tolerances()).value)
+    worst_rmargin_open = calc(u.percent,
+        lambda s: search.corners(s, "rmargin_open", s.tolerances()).value)
+
+
+    # --- optimisation ---
+    cost = calc(None, lambda s: (s.P_pneumo/1e5)**2
+                              + (s.D_pneumo/5e-3)**2
+                              + (s.ell_open/5e-3)**2
+                              + ((s.ell_open - s.ell_relaxed)/5e-3)**2
+                            )
+
+
     # --- dynamics ---
-    stroke_t_open = calc(u.ms, lambda s: s.opening.stroke_time or inf)
-    t_open = calc(u.ms, lambda s: s.opening.t_impact or inf)
-    t_crack_open = calc(u.ms, lambda s: s.opening.t_start or inf)
-    v_impact_open = calc(u.m_s, lambda s: abs(s.opening.v_impact or nan))
-    E_impact_open = calc(u.J, lambda s: s.opening.E_impact or nan)
 
-    stroke_t_close = calc(u.ms, lambda s: s.closing.stroke_time or inf)
-    t_close = calc(u.ms, lambda s: s.closing.t_impact or inf)
-    t_crack_close = calc(u.ms, lambda s: s.closing.t_start or inf)
-    v_impact_close = calc(u.m_s, lambda s: abs(s.closing.v_impact or nan))
-    E_impact_close = calc(u.J, lambda s: s.closing.E_impact or nan)
+    stroke_time = calc(u.ms,
+        lambda s: _value(s._opening.stroke_time, inf))
 
+    t_crack_open = calc(u.ms,
+        lambda s: _value(s._opening.t_start, inf))
+    t_open = calc(u.ms,
+        lambda s: _value(s._opening.t_impact, inf))
+    v_impact_open = calc(u.m_s,
+        lambda s: abs(_value(s._opening.v_impact, nan)))
+    E_impact_open = calc(u.J,
+        lambda s: _value(s._opening.E_impact, nan))
+
+    t_crack_close = calc(u.ms,
+        lambda s: _value(s._closing.t_start, inf))
+    t_close = calc(u.ms,
+        lambda s: _value(s._closing.t_impact, inf))
+    v_impact_close = calc(u.m_s,
+        lambda s: abs(_value(s._closing.v_impact, nan)))
+    E_impact_close = calc(u.J,
+        lambda s: _value(s._closing.E_impact, nan))
 
     def _forces(s, is_opening=True):
         P_tank = s.Pmin_tank if is_opening else s.Pmax_tank
@@ -213,8 +270,13 @@ class VentValve(System):
         opts.update(kw)
         return embark(self._forces(direction == "open"), **opts)
 
-    opening = computed(None)(lambda s: s.travel("open"))
-    closing = computed(None)(lambda s: s.travel("close"))
+    # Cached runs. Private, so `.report()` doesn't print them.
+    _opening = computed(None)(lambda s: s.travel("open"))
+    _closing = computed(None)(lambda s: s.travel("close"))
+    def opening(self):
+        return self._opening
+    def closing(self):
+        return self._closing
 
 
     def venting(self, V=11e-3, m0=8.0, T0=278.15):
@@ -292,38 +354,64 @@ class VentValve(System):
 
 
 def main():
-    valve = VentValve(
+    vv = VentValve(
         m=0.01936269 + 0.0089/3, stroke=1.5e-3,
         chi_seat=0.3e-3, tau_fill=5e-3, tau_vent=5e-3,
         sim_dt=0.001e-3, sim_t_end=200e-3,
-        Pmin_tank=0.0, Pmax_tank=70e5, D_ball=6e-3,
+        Pmin_tank=0.0, Pmax_tank=72e5, D_ball=6e-3,
         D_seat_bore=2e-3, D_plunger_bore=7e-3,
-        P_pneumo=10e5, D_pneumo=31.5e-3,
-        k_spring=25.5e3, ell_relaxed=25e-3, ell_open=18.2e-3, ell_solid=12.5e-3,
+        P_pneumo=30e5, D_pneumo=31.5e-3,
+        k_spring=25.5e3, ell_relaxed=25e-3, ell_open=18.2e-3,
         orings=(
             # NOTE: seal DP values are not dynamically updated.
             PistonSeal("Pneumo side",
-                    oring_ID=28.0e-3, oring_CS=2.0e-3,
-                    gland_ID=28.5e-3, gland_OD=31.5e-3, gland_Lz=3e-3,
-                    DP=10e5, material="FKM", hardness=75, lubricated=True),
+                oring_ID=28.0e-3, oring_CS=2.0e-3,
+                gland_ID=28.5e-3, gland_OD=31.5e-3, gland_Lz=3e-3,
+                DP=10e5, material="FKM", hardness=75, lubricated=True,
+            ),
             RodSeal("N2O side",
-                    oring_ID=7.5e-3, oring_CS=2.0e-3,
-                    gland_ID=7.9e-3, gland_OD=10.9e-3, gland_Lz=3e-3,
-                    DP=70e5, material="FKM", hardness=75, lubricated=True),
+                oring_ID=7.5e-3, oring_CS=2.0e-3,
+                gland_ID=7.9e-3, gland_OD=10.9e-3, gland_Lz=3e-3,
+                DP=70e5, material="FKM", hardness=75, lubricated=True,
+            ),
         ),
     )
-    # Give a little margin.
-    valve = valve.tweak(Pmax_tank=valve.Pmax_tank*1.2,
-                        P_pneumo=valve.P_pneumo/1.2)
-    # Try stronger spring?
-    valve = valve.tweak(k_spring=80e3)
-    # Size controlling forces.
-    valve = valve.tweak(F_pneumo=1200, F_spring_open=400)
 
-    valve.report()
-    valve.plot()
-    plt.show()
+    def optimise(sys):
+        params = {
+            "D_pneumo": (10e-3, 60e-3),
+            # "P_pneumo": (5e5, 30e5),
+            "k_spring": (5e3, 150e3),
+            "ell_relaxed": (5e-3, 50e-3),
+            "ell_open": (5e-3, 50e-3),
+        }
+        constraints = {
+            "worst_margin_hold_open": (20, None),
+            "worst_rmargin_hold_open": (0.1, None),
+            "worst_margin_hold_closed": (20, None),
+            "worst_rmargin_hold_closed": (0.1, None),
+            "worst_margin_close": (80, None),
+            "worst_rmargin_close": (0.1, None),
+            "worst_margin_open": (80, None),
+            "worst_rmargin_open": (0.15, None),
+        }
+        coarse = sys.tweak(sim_dt=0.02e-3)
+        opt = search.optimise(coarse, "cost", params, constraints,
+                seed=0, maxiter=30, popsize=10, workers=-1)
+        opt.report()
+        best = opt.system.tweak(sim_dt=sys.sim_dt)
+        best.report()
+        return best
+    # vv = optimise(vv)
+
+
+    vv_10barpneumo = vv.tweak(
+            D_pneumo=36e-3,
+            k_spring=100e3, ell_relaxed=8e-3, ell_open=5.183e-3
+        )
+    vv_10barpneumo.report()
 
 
 if __name__ == "__main__":
     main()
+    plt.show()
