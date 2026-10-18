@@ -152,18 +152,60 @@ class System:
         return _unit_of(cls, name)
 
 
-def calc(unit, fget, fset=None):
-    """ A property from a getter (and optional setter), with a display unit. """
-    fget.__annotations__["return"] = unit
-    return property(fget, fset)
+class output(property):
+    """
+    A property with a display unit. Cached per instance by default.
+    """
+    def __init__(self, fget=None, fset=None, fdel=None, doc=None, *,
+                 unit=None, cache=True):
+        super().__init__(fget, fset, fdel, doc)
+        self.unit = unit
+        self.cache = cache
+        self.name = None
 
-def derived(unit, source, forward, inverse=None):
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None or not self.cache or self.name is None:
+            return super().__get__(obj, objtype)
+        try:
+            return obj.__dict__[self.name]
+        except KeyError:
+            value = obj.__dict__[self.name] = self.fget(obj)
+            return value
+
+    def _copy(self, **changes):
+        kw = dict(fget=self.fget, fset=self.fset, fdel=self.fdel,
+                  doc=self.__doc__, unit=self.unit, cache=self.cache) | changes
+        return type(self)(**kw)
+
+    def getter(self, fget):
+        return self._copy(fget=fget)
+
+    def setter(self, fset):
+        return self._copy(fset=fset)
+
+
+def calc(unit, fget, fset=None, *, cache=True, doc=None):
+    """ An output from a getter (and optional setter), with a display unit. """
+    return output(fget, fset, doc=doc, unit=unit, cache=cache)
+
+def derived(unit, source, forward, inverse=None, *, cache=True, doc=None):
     """
     Helper for an output computed from one input: forward(self.<source>).
     Settable output if `inverse` is given.
     """
     fset = (lambda s, v: {source: inverse(v)}) if inverse else None
-    return calc(unit, lambda s: forward(getattr(s, source)), fset)
+    return calc(unit, lambda s: forward(getattr(s, source)), fset, cache=cache, doc=doc)
+
+def computed(unit):
+    """
+    Decorator form for long getters: @computed(u.N) instead of @property, and
+    caches the result.
+    """
+    return lambda fget: output(fget, unit=unit)
+
 
 
 @cache
@@ -172,6 +214,8 @@ def _unit_of(cls, name):
         hint = typing.get_type_hints(cls, include_extras=True).get(name)
     else:
         attr = getattr(cls, name, None)
+        if isinstance(attr, output):
+            return unit_of(attr.unit)
         fget = getattr(attr, "fget", None) or getattr(attr, "func", None)
         if fget is None:
             raise AttributeError(f"{cls.__name__} has no input or output "

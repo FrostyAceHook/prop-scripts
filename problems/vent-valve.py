@@ -6,6 +6,7 @@ Spring-return vent valve.
 """
 
 from math import pi, sqrt, exp, inf, nan
+import matplotlib.pyplot as plt
 
 # Hack-in the utility module.
 import sys
@@ -32,18 +33,29 @@ def circ_perim_to_D(p):
 def frustum_area(h, D1, D2):
     return pi/2*(D1 + D2)*sqrt(h*h + (D1 - D2)**2/4)
 
+def calc_circ_D(name):
+    return derived(u.mm, name, circ_area_to_D, circ_area)
+def calc_circ_A(name):
+    return derived(u.mm2, name, circ_area, circ_area_to_D)
+
 
 class VentValve(System):
     # --- movement ---
-    stroke: u.mm
+    m: u.kg # Moving mass: plunger mass + 1/3 spring mass
+    stroke: u.mm # Plunger stroke length.
+    chi_seat: u.mm # Un-seating length constant.
+    tau_fill: u.ms # Pneumo fill time constant.
+    tau_vent: u.ms # Pneumo vent time constant.
+    sim_dt: u.ms # Simulation time step.
+    sim_t_end: u.ms # Simulation max sim time.
 
     # --- tank side: opening ---
     Pmin_tank: u.bar
     Pmax_tank: u.bar
     D_ball: u.mm
     D_seat = derived(u.mm, "D_ball", lambda x: x/SQRT2, lambda x: x*SQRT2)
-    A_seat = derived(u.mm2, "D_seat", circ_area, circ_area_to_D)
-    A_ball = derived(u.mm2, "D_ball", circ_area, circ_area_to_D)
+    A_seat = calc_circ_A("D_seat")
+    A_ball = calc_circ_A("D_ball")
     Fmin_tank_open = calc(u.N,
         lambda s: s.Pmin_tank*s.A_ball,
         lambda s, F: dict(A_ball=F/s.Pmin_tank))
@@ -58,20 +70,22 @@ class VentValve(System):
         lambda s, F: dict(A_seat=F/s.Pmax_tank))
 
     # --- past-seal flow ---
-    D_bore: u.mm
-    A_flow_cone = calc(u.mm2,
+    D_seat_bore: u.mm
+    A_seat_bore = calc_circ_A("D_seat_bore")
+    D_plunger_bore: u.mm
+    A_plunger_bore = calc(u.mm2,
+        lambda s: circ_area(s.D_plunger_bore) - circ_area(s.D_ball),
+        lambda s, A: dict(D_plunger_bore=
+            circ_area_to_D(A + circ_area(s.D_ball))))
+    D_seat_cone = calc_circ_D("A_seat_cone")
+    A_seat_cone = calc(u.mm2,
         lambda s: frustum_area(s.stroke/2, s.D_seat + s.stroke, s.D_seat),
         lambda s, A: dict(stroke=sqrt(s.D_seat**2 + 2*SQRT2*A/pi) - s.D_seat))
-    A_flow_bore = calc(u.mm2,
-        lambda s: circ_area(s.D_bore) - circ_area(s.D_ball),
-        lambda s, A: dict(D_bore=circ_area_to_D(A + circ_area(s.D_ball))))
-    D_flow_cone = derived(u.mm, "A_flow_cone", circ_area_to_D, circ_area)
-    D_flow_bore = derived(u.mm, "A_flow_bore", circ_area_to_D, circ_area)
 
     # --- pneumo side: closing ---
     P_pneumo: u.bar
     D_pneumo: u.mm
-    A_pneumo = derived(u.mm2, "D_pneumo", circ_area, circ_area_to_D)
+    A_pneumo = calc_circ_A("D_pneumo")
     F_pneumo = calc(u.N,
         lambda s: s.P_pneumo*s.A_pneumo,
         lambda s, F: dict(A_pneumo=F/s.P_pneumo))
@@ -146,34 +160,86 @@ class VentValve(System):
         ))
 
 
+    # --- dynamics ---
+    def _forces(s, opening=True):
+        P_tank = s.Pmin_tank if opening else s.Pmax_tank
+        def tank(t, x, v):
+            t = min(max(x/s.chi_seat, 0.0), 1.0)
+            return P_tank * (s.A_seat + t * (s.A_ball - s.A_seat))
+        def pneumo(t, x, v):
+            if opening:
+                return -s.F_pneumo * exp(-t/s.tau_fill)
+            else:
+                return -s.F_pneumo * (1.0 - exp(-t/s.tau_vent))
+        def spring(t, x, v):
+            return s.F_spring(x)
+        @travel.Friction
+        def o_ring(t, x, v):
+            return s.F_fric_breakaway if v == 0 else s.F_fric_running
+        return dict(tank=tank, pneumo=pneumo, spring=spring, o_ring=o_ring)
 
-def baseline():
-    return VentValve(
-        stroke=1.5e-3,
-        Pmin_tank=0.0, Pmax_tank=1.25*70e5, D_ball=6e-3, # +25% tank actual.
-        D_bore=7.2e-3,
-        P_pneumo=10e5/1.25, D_pneumo=31.5e-3, # -25% pneumo actual.
+    def simulate(self, direction, **kw):
+        """ Run the travel sim in the given `direction` ("open" or "close"). """
+        if direction == "open":
+            x0 = 0.0
+        elif direction == "close":
+            x0 = self.stroke
+        else:
+            raise ValueError("direction must be 'open' or 'close'")
+        opts = dict(
+            dt=self.sim_dt,
+            t_end=self.sim_t_end,
+            t_after_impact=0.0,
+            mass=self.m,
+            x0=x0,
+            x_min=0.0,
+            x_max=self.stroke,
+            title="Valve opening" if direction == "open" else "Valve closing",
+        )
+        opts.update(kw)
+        return travel.travel(self._forces(direction == "open"), **opts)
+
+    def opening(self):
+        return self.simulate("open")
+    def closing(self):
+        return self.simulate("close")
+    def plot(self):
+        return self.opening().plot(), self.closing().plot()
+
+
+
+def main():
+    valve = VentValve(
+        m=0.01936269 + 0.0089/3, stroke=1.5e-3,
+        chi_seat=0.3e-3, tau_fill=20e-3, tau_vent=20e-3,
+        sim_dt=0.01e-3, sim_t_end=200e-3,
+        Pmin_tank=0.0, Pmax_tank=70e5, D_ball=6e-3,
+        D_seat_bore=2e-3, D_plunger_bore=7e-3,
+        P_pneumo=10e5, D_pneumo=31.5e-3,
         k_spring=25.5e3, ell_relaxed=25e-3, ell_open=18.2e-3, ell_solid=12.5e-3,
         orings=(
             # NOTE: seal DP values are not dynamically updated.
             PistonSeal("Pneumo side",
                     oring_ID=28.0e-3, oring_CS=2.0e-3,
                     gland_ID=28.5e-3, gland_OD=31.5e-3, gland_Lz=3e-3,
-                    DP=30e5, material="FKM", hardness=75, lubricated=True),
+                    DP=10e5, material="FKM", hardness=75, lubricated=True),
             RodSeal("N2O side",
                     oring_ID=7.5e-3, oring_CS=2.0e-3,
                     gland_ID=7.9e-3, gland_OD=10.9e-3, gland_Lz=3e-3,
                     DP=70e5, material="FKM", hardness=75, lubricated=True),
         ),
     )
-
-
-def main():
-    valve = baseline()
+    # Give a little margin.
+    valve = valve.tweak(Pmax_tank=valve.Pmax_tank*1.2,
+                        P_pneumo=valve.P_pneumo/1.2)
+    # Try stronger spring?
     valve = valve.tweak(k_spring=80e3)
-    valve = valve.tweak(F_pneumo=1200)
-    valve = valve.tweak(F_spring_open=400)
+    # Size controlling forces.
+    valve = valve.tweak(F_pneumo=1200, F_spring_open=400)
+
     valve.report()
+    valve.plot()
+    plt.show()
 
 
 if __name__ == "__main__":
