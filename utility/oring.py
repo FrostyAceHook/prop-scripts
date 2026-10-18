@@ -248,48 +248,64 @@ class Oring(ABC):
         return warnings
 
 
-    # ---- Report ---------------------------------------------------------------
+    # ---- Summary --------------------------------------------------------------
 
     def seal_name(self):
         return "bare o-ring"
-    def report_environment(self):
-        print(f"{self.name} ({self.seal_name()})")
+    def summary_environment(self):
         lube = "lubed" if self.lubricated else "dry"
-        print(f"  material        {self.material} {self.hardness}A, {lube} ")
-        print(f"  pressure diff   {fmt_bar(self.DP)}")
-    def report_dimensions(self):
-        print("  --")
-        print("  oring (IDxCS)   "
-                f"{fmt_mm(self.oring_ID)} x {fmt_mm(self.oring_CS)}")
-        print("  gland (ID/OD)   "
-                f"{fmt_mm(self.gland_ID)} / {fmt_mm(self.gland_OD)}")
-        print("  gland (WxD)     "
-                f"{fmt_mm(self.gland_width)} x {fmt_mm(self.gland_depth)}")
-        print(f"  effective CS    {fmt_mm(self.effective_CS())}")
-    def report_fit(self):
-        print("  --")
-        print(f"  squeeze         {fmt_pt(self.squeeze())} (aim 10--20%)")
-        print(f"  gland fill      {fmt_pt(self.gland_fill())} (aim 60--80%)")
-    def report_contact(self):
-        print("  --")
-        print(f"  contact load    {fmt_num(self.q_normal_squeeze()*1e-3)} N/mm")
-        print(f"  contact width   {fmt_mm(self.contact_width())}")
+        return (
+            f"{self.name} ({self.seal_name()})\n"
+            f"  material        {self.material} {self.hardness}A, {lube}\n"
+            f"  pressure diff   {fmt_bar(self.DP)}\n"
+        )
+    def summary_dimensions(self):
+        return (
+            "  --\n"
+            "  oring (IDxCS)   "
+                f"{fmt_mm(self.oring_ID)} x {fmt_mm(self.oring_CS)}\n"
+            "  gland (ID/OD)   "
+                f"{fmt_mm(self.gland_ID)} / {fmt_mm(self.gland_OD)}\n"
+            "  gland (WxD)     "
+                f"{fmt_mm(self.gland_width)} x {fmt_mm(self.gland_depth)}\n"
+            f"  effective CS    {fmt_mm(self.effective_CS())}\n"
+        )
+    def summary_fit(self):
+        return (
+            "  --\n"
+            f"  squeeze         {fmt_pt(self.squeeze())} (aim 10--20%)\n"
+            f"  gland fill      {fmt_pt(self.gland_fill())} (aim 60--80%)\n"
+        )
+    def summary_contact(self):
         peak_stress = self.contact_peak_stress()
-        print(f"  peak stress     {fmt_MPa(peak_stress)} + ~DP = "
-              f"~{fmt_MPa(peak_stress + self.DP)}")
-    def report_forces(self):
-        print("  --")
-    def report(self):
-        self.report_environment()
-        self.report_dimensions()
-        self.report_fit()
-        self.report_contact()
-        self.report_forces()
-        warnings = self.checks()
-        if warnings:
-            print("  --")
-            for warning in warnings:
-                print(f"  !! {warning}")
+        return (
+            "  --\n"
+            f"  contact load    {fmt_num(self.q_normal_squeeze()*1e-3)} N/mm\n"
+            f"  contact width   {fmt_mm(self.contact_width())}\n"
+            f"  peak stress     {fmt_MPa(peak_stress)} + ~DP = "
+                f"~{fmt_MPa(peak_stress + self.DP)}\n"
+        )
+    def summary_forces(self):
+        return "  --\n"
+    def summary(self):
+        warnings = ""
+        checks = self.checks()
+        if checks:
+            warnings = "  --\n"
+            warnings += "".join(f"  !! {warning}\n" for warning in checks)
+        return "".join([
+            self.summary_environment(),
+            self.summary_dimensions(),
+            self.summary_fit(),
+            self.summary_contact(),
+            self.summary_forces(),
+            warnings
+        ])
+    def report(self, *args, **kwargs):
+        print(self.summary(*args, **kwargs))
+
+    def __repr__(self):
+        return f"<o-ring {self.name!r}>"
 
 class ExceptionStaticSeal(Exception):
     pass
@@ -367,24 +383,24 @@ class RadialSeal(Oring):
 
     def seal_name(self):
         return f"{self.kind} seal"
-    def report_fit(self):
-        super().report_fit()
-        if self.kind == "piston":
-            print(f"  ID stretch      {fmt_pt(self.ID_stretch())} (aim 1--5%)")
-        else:
-            print(f"  OD compression  {fmt_pt(self.OD_compression())} "
-                    "(aim 1--3%)")
-    def report_forces(self):
-        super().report_forces()
-        print(f"  F_normal        {fmt_N(self.F_normal())} "
-              f"(squeeze {fmt_N(self.F_normal_squeeze())} + "
-              f"pressure {fmt_N(self.F_normal_pressure())})")
-        F = self.F_friction_running
-        print(f"  F_fric running  {fmt_N(F(NOM))} "
-                f"({fmt_N(F(LOW))[:-2]}--{fmt_N(F(HIGH))})")
-        F = self.F_friction_breakaway
-        print(f"  F_fric breakaway  {fmt_N(F(NOM))} "
-                f"({fmt_N(F(LOW))[:-2]}--{fmt_N(F(HIGH))})")
+    def summary_fit(self):
+        return super().summary_fit() + (
+            (f"  ID stretch      {fmt_pt(self.ID_stretch())} (aim 1--5%)\n"
+                if self.kind == "piston" else
+            f"  OD compression  {fmt_pt(self.OD_compression())} (aim 1--3%)\n")
+        )
+    def summary_forces(self):
+        Fr = self.F_friction_running
+        Fb = self.F_friction_breakaway
+        return super().summary_forces() + (
+            f"  F_normal        {fmt_N(self.F_normal())} "
+                f"(squeeze {fmt_N(self.F_normal_squeeze())} + "
+                f"pressure {fmt_N(self.F_normal_pressure())})\n"
+            f"  F_fric breakaway  {fmt_N(Fb(NOM))} "
+                    f"({fmt_N(Fb(LOW))[:-2]}--{fmt_N(Fb(HIGH))})\n"
+            f"  F_fric running  {fmt_N(Fr(NOM))} "
+                    f"({fmt_N(Fr(LOW))[:-2]}--{fmt_N(Fr(HIGH))})\n"
+        )
 
 
 class PistonSeal(RadialSeal):
@@ -484,28 +500,24 @@ class FaceSeal(Oring):
 
     def seal_name(self):
         return f"{self.kind} face seal"
-    def report_dimensions(self):
-        super().report_dimensions()
-        print(f"  effective MD    {fmt_mm(self.effective_MD())}")
-    def report_fit(self):
-        super().report_fit()
-        if self.kind == "internal":
-            print(f"  OD compression  {fmt_pt(self.OD_compression())} "
-                    "(aim 1--3%)")
-        else:
-            print(f"  ID stretch      {fmt_pt(self.ID_stretch())} "
-                    "(aim 1--5%)")
-    def report_forces(self):
-        super().report_forces()
-        pm = "+" if self.kind == "internal" else "-"
-        if self.kind == "internal":
-            print("  F_axial clamp   "
-                    f"{fmt_N(self.F_axial_closure())} + pressure = "
-                    f"{fmt_N(self.F_axial())} (upper-bound)")
-        else:
-            print("  F_axial clamp   "
-                    f"{fmt_N(self.F_axial_closure())} - pressure = "
-                    "geom-dependent")
+    def summary_dimensions(self):
+        return super().summary_dimensions() + (
+            f"  effective MD    {fmt_mm(self.effective_MD())}\n"
+        )
+    def summary_fit(self):
+        return super().summary_fit() + (
+            (f"  OD compression  {fmt_pt(self.OD_compression())} (aim 1--3%)\n"
+                if self.kind == "internal" else
+            f"  ID stretch      {fmt_pt(self.ID_stretch())} (aim 1--5%)\n")
+        )
+    def summary_forces(self):
+        return super().summary_forces() + (
+            (f"  F_axial clamp   {fmt_N(self.F_axial_closure())} + pressure = "
+                    f"{fmt_N(self.F_axial())} (upper-bound)\n"
+                if self.kind == "internal" else
+            f"  F_axial clamp   {fmt_N(self.F_axial_closure())} - pressure = "
+                    "geom-dependent\n")
+        )
 
 
 class InternalFaceSeal(FaceSeal):
