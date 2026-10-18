@@ -65,10 +65,10 @@ class Friction:
 
 @dataclass(frozen=True, slots=True)
 class Impact:
-    t: float       # [s] time of contact
-    stop: str      # "min" or "max"
-    v: float       # [m/s] velocity just before contact
-    energy: float  # [J] kinetic energy at contact
+    stop: str # "min" or "max"
+    t: float # [s] time of contact
+    v: float # [m/s] velocity just before contact
+    E: float # [J] kinetic energy at contact
 
 
 @dataclass(eq=False)
@@ -98,26 +98,24 @@ class TravelResult:
         return self.t[moved[0] - 1] if moved.size else None
 
     @property
-    def first_impact(self): # [impact] First impact  object.
+    def first_impact(self): # [impact] First impact object.
         return self.impacts[0] if self.impacts else None
 
     @property
-    def t_arrive(self): # [s] Time of first impact.
+    def t_impact(self): # [s] Time of first impact.
         return self.impacts[0].t if self.impacts else None
-
     @property
     def v_impact(self): # [m/s] Speed of first impact.
         return self.impacts[0].v if self.impacts else None
-
     @property
-    def impact_energy(self): # [J] Energy of first impact.
-        return self.impacts[0].energy if self.impacts else None
+    def E_impact(self): # [J] Energy of first impact.
+        return self.impacts[0].E if self.impacts else None
 
     @property
     def stroke_time(self): # [s] Time for first impact after starting.
-        if self.t_start is None or self.t_arrive is None:
+        if self.t_start is None or self.t_impact is None:
             return None
-        return self.t_arrive - self.t_start
+        return self.t_impact - self.t_start
 
 
     # ---- Reporting ------------------------------------------------------------
@@ -139,12 +137,15 @@ class TravelResult:
             f"  hits {imp.stop} stop after {fmt_ms(imp.t)}",
             f"  stroke time   : {fmt_ms(self.stroke_time)}",
             f"  impact speed  : {fmt_m_s(abs(imp.v))}",
-            f"  impact energy : {fmt_num(imp.energy)} J",
+            f"  impact energy : {fmt_num(imp.E)} J",
         ]
         if len(self.impacts) > 1:
             lines.append(f"  ... with {len(self.impacts) - 1} further impact(s) "
                     "from bouncing")
         return "\n".join(lines)
+
+    def __repr__(self):
+        return f"<travel {self.title!r}>"
 
     def __str__(self):
         return self.summary()
@@ -206,8 +207,8 @@ class TravelResult:
 
         for ax in axes:
             ax.set_xlim([-0.01*t[-1], 1.01*t[-1]])
-            if self.t_arrive is not None:
-                ax.axvline(self.t_arrive * 1e3, c="r", lw=1.0, alpha=0.5)
+            if self.t_impact is not None:
+                ax.axvline(self.t_impact * 1e3, c="r", lw=1.0, alpha=0.5)
 
         if label:
             axes[0].legend()
@@ -250,7 +251,7 @@ def travel(forces, mass, x0, x_min, x_max, *,
 
     N = int(round(t_end / dt)) + 1
     xs, vs, ms, accs = [float(x0)], [float(v0)], [], []
-    Fd_hist, cap_hist = [], []
+    Fd_hist, Ff_hist = [], []
     d_hist = [[] for _ in d_fns]
     f_hist = [[] for _ in f_fns]
     impacts = []
@@ -259,6 +260,7 @@ def travel(forces, mass, x0, x_min, x_max, *,
     # Direction of motion, kept for when there's no drive. Initialise to only
     # possible option when at one of the stops.
     last_s = 1.0 if (x0 == x_min) else -1.0
+    last_hist_s = last_s
 
     for i in range(N):
         ti = i * dt
@@ -272,35 +274,39 @@ def travel(forces, mass, x0, x_min, x_max, *,
             F_drive += f
 
         caps = [abs(fn(ti, xi, vi)) for fn in f_fns]
-        cap = sum(caps)
+        F_fric = sum(caps)
         Fd_hist.append(F_drive)
-        cap_hist.append(cap)
+        Ff_hist.append(F_fric)
         pinned = (xi >= x_max and F_drive > 0.0) \
               or (xi <= x_min and F_drive < 0.0)
 
         # Get frictional direction.
         if vi != 0.0:
             s = 1.0 if vi > 0.0 else -1.0
-        # elif F_drive != 0.0:
-        #     s = 1.0 if F_drive > 0.0 else -1.0
+            hist_s = s
+        elif F_drive != 0.0:
+            s = 1.0 if F_drive > 0.0 else -1.0
+            hist_s = last_hist_s # maintain prev plotted sign.
         else:
             s = last_s
+            hist_s = last_hist_s
         last_s = s
+        last_hist_s = hist_s
 
         for c, h in zip(caps, f_hist):
-            h.append(-s * c) # full capacity, signed against (impending) motion.
+            h.append(-hist_s * c) # history/plotting only. full capacity.
 
-        if vi == 0.0 and (pinned or abs(F_drive) <= cap):
+        if vi == 0.0 and (pinned or abs(F_drive) <= F_fric):
             acc = 0.0 # a stop carries the load, or friction holds.
         else:
-            acc = (F_drive - s * cap) / mi
+            acc = (F_drive - s * F_fric) / mi
 
         if i == N - 1 or ti >= t_quit:
             accs.append(nan)
             break
 
         v_new = vi + acc * dt
-        if cap > 0.0 and vi != 0.0 and (v_new > 0.0) != (vi > 0.0):
+        if F_fric > 0.0 and vi != 0.0 and (v_new > 0.0) != (vi > 0.0):
             # Velocity crosses zero, so stop for at-least a tick so the next step
             # decides (via the stuck check) whether static friction holds it.
             v_new = 0.0
@@ -310,8 +316,8 @@ def travel(forces, mass, x0, x_min, x_max, *,
         if x_new <= x_min and v_new < 0.0:
             if xi > x_min:
                 impacts.append(Impact(
-                    ti + dt,
                     "min",
+                    ti + dt,
                     v_new,
                     0.5 * mi * v_new*v_new
                 ))
@@ -322,8 +328,8 @@ def travel(forces, mass, x0, x_min, x_max, *,
         elif x_new >= x_max and v_new > 0.0:
             if xi < x_max:
                 impacts.append(Impact(
-                    ti + dt,
                     "max",
+                    ti + dt,
                     v_new,
                     0.5 * mi * v_new*v_new))
                 v_new = -restitution * v_new
@@ -353,6 +359,6 @@ def travel(forces, mass, x0, x_min, x_max, *,
         forces=F,
         frictions=frozenset(f_names),
         F_drive=np.asarray(Fd_hist),
-        F_frictional=np.asarray(cap_hist),
+        F_frictional=np.asarray(Ff_hist),
         impacts=tuple(impacts)
     )

@@ -80,7 +80,7 @@ _ABSZ = 273.15
 
 
 # Dimensionless.
-ratio = Annotated[_Float, Unit("-")]
+ratio = Annotated[_Float, None]
 percent = Annotated[_Float, Unit("%", 1e-2)]
 
 # Length.
@@ -149,3 +149,6 @@ K = Annotated[_Float, Unit("K")]
 degC = Annotated[_Float, Unit("°C", 1.0, _ABSZ)]
 degF = Annotated[_Float, Unit("°F", 5/9, _ABSZ - 32 * 5/9)]
 degdF = Annotated[_Float, Unit("Δ°F", 5/9)]
+
+# Hardness.
+shoreA = Annotated[_Float, Unit("shore A")]

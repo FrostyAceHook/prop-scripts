@@ -5,6 +5,9 @@ O-ring calculator, for friction as well as stretch/squeeze/gland analysis.
 from abc import ABC, abstractmethod
 from math import pi, sqrt, floor, log10, erf, isfinite
 
+import units as u
+from system import System, calc, computed
+
 
 # Formatting helpers.
 def fmt_num(x, sig=4):
@@ -47,12 +50,20 @@ FRICTION = {
 LOW, NOM, HIGH = 0, 1, 2
 
 
-class Oring(ABC):
+def _shift_gland(s, MD):
+    # Move the gland to a new mid-diameter, keeping its radial size. Sets the
+    # wall moving away first, so the gland never inverts partway through.
+    ID, OD = MD - s.gland_Lr, MD + s.gland_Lr
+    if MD > s.gland_MD:
+        return dict(gland_OD=OD, gland_ID=ID)
+    return dict(gland_ID=ID, gland_OD=OD)
+
+
+class Oring(System, ABC):
     """
     Common geometry, material and force maths for an O-ring in a gland.
     Abstract: use PistonSeal, RodSeal, InternalFaceSeal or ExternalFaceSeal.
     """
-
 
     # [-] Squeeze limits.
     squeeze_min = 0.08
@@ -65,117 +76,140 @@ class Oring(ABC):
     ID_stretch_max = 0.05
     OD_compression_max = 0.03
 
-    def __init__(self, name, oring_ID, oring_CS, gland_ID, gland_OD, gland_Lz,
-                DP, material="FKM", hardness=75, lubricated=False):
-        if material not in HARDNESS_RANGE:
+    name: str # Cosmetic name.
+    oring_ID: u.mm
+    oring_CS: u.mm
+    gland_ID: u.mm
+    gland_OD: u.mm
+    gland_Lz: u.mm
+    DP: u.bar # Pressure difference across the seal.
+    material: str
+    hardness: u.shoreA
+    lubricated: bool
+    friction_level: int = NOM # Which friction coefficients: LOW, NOM or HIGH.
+
+    def __init_subclass__(cls, **options):
+        # Keep the short `__repr__` below for every seal type, rather than the
+        # dataclass one listing every field.
+        super().__init_subclass__(**{"repr": False, **options})
+
+    def __post_init__(self):
+        if self.material not in HARDNESS_RANGE:
             raise ValueError(f"material must be one of {list(HARDNESS_RANGE)}")
-        low, high = HARDNESS_RANGE[material]
-        if not low <= hardness <= high:
-            raise ValueError(f"{material} hardness must be {low}--{high} Shore "
-                    "A")
-        if not 0 < gland_ID < gland_OD:
+        low, high = HARDNESS_RANGE[self.material]
+        if not low <= self.hardness <= high:
+            raise ValueError(f"{self.material} hardness must be {low}--{high} "
+                    "Shore A")
+        if not 0 < self.gland_ID < self.gland_OD:
             raise ValueError("need 0 < gland_ID < gland_OD")
-        if oring_ID <= 0 or oring_CS <= 0:
+        if self.oring_ID <= 0 or self.oring_CS <= 0:
             raise ValueError("O-ring ID and CS must be positive")
-        if gland_Lz <= 0:
+        if self.gland_Lz <= 0:
             raise ValueError("gland_Lz must be positive")
-        if DP < 0:
+        if self.DP < 0:
             raise ValueError("DP must be zero or positive")
-        for v in (oring_ID, oring_CS, gland_ID, gland_OD, gland_Lz, DP,
-                hardness):
+        if self.friction_level not in (LOW, NOM, HIGH):
+            raise ValueError("friction_level must be LOW, NOM or HIGH")
+        for v in (self.oring_ID, self.oring_CS, self.gland_ID, self.gland_OD,
+                self.gland_Lz, self.DP, self.hardness):
             if not isfinite(v):
                 raise ValueError("inputs must be finite numbers")
-
-        self.name = name
-        self.oring_ID = oring_ID
-        self.oring_CS = oring_CS
-        self.gland_ID = gland_ID
-        self.gland_OD = gland_OD
-        self.gland_Lz = gland_Lz
-        self.DP = DP
-        self.material = material
-        self.hardness = hardness
-        self.lubricated = lubricated
 
 
     # ---- O-ring and gland geometry ---------------------------------------
 
-    @property
-    def oring_OD(self):
-        return self.oring_ID + 2*self.oring_CS
-    @property
-    def oring_MD(self):
-        return self.oring_ID + self.oring_CS
-    @property
-    def gland_Lr(self):
-        return (self.gland_OD - self.gland_ID)/2
-    @property
-    def gland_MD(self):
-        return (self.gland_ID + self.gland_OD)/2
+    oring_OD = calc(u.mm, # Sets oring_ID (keeps CS).
+        lambda s: s.oring_ID + 2*s.oring_CS,
+        lambda s, OD: dict(oring_ID=OD - 2*s.oring_CS))
+    oring_MD = calc(u.mm, # Sets oring_ID (keeps CS).
+        lambda s: s.oring_ID + s.oring_CS,
+        lambda s, MD: dict(oring_ID=MD - s.oring_CS))
+    gland_Lr = calc(u.mm, # Set through gland_depth/gland_width instead.
+        lambda s: (s.gland_OD - s.gland_ID)/2)
+    gland_MD = calc(u.mm, # Moves the gland, keeping gland_Lr.
+        lambda s: (s.gland_ID + s.gland_OD)/2,
+        lambda s, MD: _shift_gland(s, MD))
 
-    @property
+    @computed(u.mm)
     @abstractmethod
-    def gland_depth(self): ...
-    @property
+    def gland_depth(self): ... # Squeeze direction.
+    @computed(u.mm)
     @abstractmethod
     def gland_width(self): ...
+    gland_area = calc(u.mm2, # Sets gland_width.
+        lambda s: s.gland_depth * s.gland_width,
+        lambda s, A: dict(gland_width=A / s.gland_depth))
 
-    def gland_area(self):
-        return self.gland_depth * self.gland_width
-
-    @property
+    @computed(u.mm)
     @abstractmethod
-    def contact_D(self): ...
+    def contact_D(self): ... # Sealing line diameter.
 
 
     # ---- Material -------------------------------------------------------------
 
-    @property
-    def E(self): # [Pa] Young's modulus.
+    @computed(u.MPa)
+    def E(self): # Young's modulus. Sets hardness.
         # BS 903 relation, S = 100 erf(3.186e-4 sqrt(E)).
         lo, hi = 0.0, 3.0
         for _ in range(60):
             x = (lo + hi) / 2
             lo, hi = (x, hi) if erf(x) < self.hardness / 100 else (lo, x)
         return (x / 3.186e-4)**2
-    @property
-    def nu(self): # [-] Poisson's constant.
-        return 0.5 # essentially/assumed incompressible.
+    @E.setter
+    def E(self, E):
+        return dict(hardness=100 * erf(3.186e-4 * sqrt(E)))
+    nu = calc(u.ratio, # Poisson's constant.
+        lambda s: 0.5) # essentially/assumed incompressible.
 
-    def mu_running(self, level=NOM):
-        return FRICTION[(self.material, self.lubricated)]["running"][level]
-    def mu_pressure(self, level=NOM):
-        return FRICTION[(self.material, self.lubricated)]["pressure"][level]
-    def mu_breakaway(self, level=NOM):
-        return FRICTION[(self.material, self.lubricated)]["breakaway"][level]
+    def mu(self, kind):
+        """ Friction coefficient of the given `kind`, at `friction_level`. """
+        return FRICTION[(self.material, self.lubricated)][kind]\
+                [self.friction_level]
+    mu_running = calc(u.ratio, lambda s: s.mu("running"))
+    mu_pressure = calc(u.ratio, lambda s: s.mu("pressure"))
+    mu_breakaway = calc(u.ratio, lambda s: s.mu("breakaway"))
 
 
     # ---- O-ring fit -----------------------------------------------------------
 
+    @computed(u.mm)
     @abstractmethod
     def effective_MD(self): ...
-    def effective_CS(self):
-        return self.oring_CS * sqrt(self.oring_MD / self.effective_MD())
+    effective_CS = calc(u.mm,
+        lambda s: s.oring_CS * sqrt(s.oring_MD / s.effective_MD))
 
-    def squeeze(self):
-        CS = self.effective_CS()
-        return max(0.0, 1 - self.gland_depth/CS)
-    def gland_fill(self):
-        return pi/4 * self.effective_CS()**2 / self.gland_area()
+    @computed(u.percent)
+    def squeeze(self): # Sets gland_depth.
+        return max(0.0, 1 - self.gland_depth/self.effective_CS)
+    @squeeze.setter
+    def squeeze(self, e):
+        # Effective CS depends (weakly) on the gland, so iterate to converge.
+        o = self
+        for _ in range(20):
+            o = o.tweak(gland_depth=o.effective_CS * (1 - e))
+        return dict(gland_depth=o.gland_depth)
+    gland_fill = calc(u.percent, # Sets gland_width.
+        lambda s: pi/4 * s.effective_CS**2 / s.gland_area,
+        lambda s, f: dict(gland_width=
+            pi/4 * s.effective_CS**2 / (f * s.gland_depth)))
 
-    def ID_stretch(self):
-        return self.gland_ID/self.oring_ID - 1
-    def OD_compression(self):
-        return 1 - self.gland_OD/self.oring_OD
+    ID_stretch = calc(u.percent, # Sets oring_ID.
+        lambda s: s.gland_ID/s.oring_ID - 1,
+        lambda s, x: dict(oring_ID=s.gland_ID / (1 + x)))
+    OD_compression = calc(u.percent, # Sets oring_ID.
+        lambda s: 1 - s.gland_OD/s.oring_OD,
+        lambda s, x: dict(oring_OD=s.gland_OD / (1 - x)))
 
 
     # ---- Normal (contact) forces ----------------------------------------------
 
+    @computed(u.N_mm)
     def q_normal_squeeze(self):
         # Lindley: normal force from squeeze per unit length of sealing line.
-        e = self.squeeze() # [N/m]
-        return self.E * self.effective_CS() * (1.25 * e**1.5 + 50 * e**6)
+        e = self.squeeze
+        return self.E * self.effective_CS * (1.25 * e**1.5 + 50 * e**6)
 
+    @computed(u.mm)
     def contact_width(self):
         # Hertz line contact: the cross-section treated as a cylinder of radius
         # CS/2 pressed onto a flat wall with line load q, at zero pressure.
@@ -183,56 +217,48 @@ class Oring(ABC):
         # b << CS; at typical squeezes b ~ CS/2, so this is extrapolated
         # (geometry suggests the real width is ~15% larger).
         E_star = self.E / (1 - self.nu**2)
-        R = self.effective_CS() / 2
-        return 2 * sqrt(4 * self.q_normal_squeeze() * R / (pi * E_star))
+        R = self.effective_CS / 2
+        return 2 * sqrt(4 * self.q_normal_squeeze * R / (pi * E_star))
 
+    @computed(u.MPa)
     def contact_peak_stress(self):
         # Peak of the Hertz profile at zero pressure: p0 = 4q / (pi b). Indicates
         # low-pressure / start-up sealing. Under pressure the rubber transmits DP
         # like a fluid, so contact is roughly p0 + DP.
-        b = self.contact_width()
-        return 4/pi * self.q_normal_squeeze() / b if (b > 0) else 0.0
+        b = self.contact_width
+        return 4/pi * self.q_normal_squeeze / b if (b > 0) else 0.0
 
-    def F_normal_squeeze(self):
-        # Total normal force on the sliding surface from squeeze.
-        return self.q_normal_squeeze() * pi * self.contact_D
-    def F_normal_pressure(self):
-        # Extra normal force on the sliding surface: pressure is transmitted
-        # through the rubber and acts over the contact band.
-        return self.DP * self.contact_width() * pi * self.contact_D
-    def F_normal(self):
-        return self.F_normal_squeeze() + self.F_normal_pressure()
-
-
-    # ---- Friction (along the sliding direction) -------------------------------
-
-    def F_friction_running(self, level=NOM):
-        return (self.mu_running(level) * self.F_normal_squeeze()
-              + self.mu_pressure(level) * self.F_normal_pressure())
-    def F_friction_breakaway(self, level=NOM):
-        return self.mu_breakaway(level) * self.F_normal()
+    # Total normal force on the sliding surface from squeeze.
+    F_normal_squeeze = calc(u.N,
+        lambda s: s.q_normal_squeeze * pi * s.contact_D)
+    # Extra normal force on the sliding surface: pressure is transmitted
+    # through the rubber and acts over the contact band.
+    F_normal_pressure = calc(u.N,
+        lambda s: s.DP * s.contact_width * pi * s.contact_D)
+    F_normal = calc(u.N,
+        lambda s: s.F_normal_squeeze + s.F_normal_pressure)
 
 
     # ---- Checks ---------------------------------------------------------------
 
     def checks_ID_stretch(self, loose_message):
-        if self.ID_stretch() < 0:
+        if self.ID_stretch < 0:
             return [loose_message]
-        if self.ID_stretch() > self.ID_stretch_max:
+        if self.ID_stretch > self.ID_stretch_max:
             return [f"ID stretch above {fmt_pt(self.ID_stretch_max)} "
                     "- thins the O-ring and speeds up ageing"]
         return []
     def checks_OD_compression(self, loose_message):
-        if self.OD_compression() < 0:
+        if self.OD_compression < 0:
             return [loose_message]
-        if self.OD_compression() > self.OD_compression_max:
+        if self.OD_compression > self.OD_compression_max:
             return [f"OD compression above {fmt_pt(self.OD_compression_max)} "
                     "- can pucker or twist in the gland"]
         return []
 
     def checks(self):
         warnings = []
-        s = self.squeeze()
+        s = self.squeeze
         if s <= 0:
             warnings.append("NO CONTACT "
                     "- O-ring is not squeezed, it will not seal")
@@ -242,7 +268,7 @@ class Oring(ABC):
         elif s > self.squeeze_max:
             warnings.append(f"squeeze above {fmt_pt(self.squeeze_max)} "
                     "- risk of damage and overfill")
-        if self.gland_fill() > self.gland_fill_max:
+        if self.gland_fill > self.gland_fill_max:
             warnings.append(f"gland fill above {fmt_pt(self.gland_fill_max)} "
                     "- widen the gland")
         return warnings
@@ -252,14 +278,14 @@ class Oring(ABC):
 
     def seal_name(self):
         return "bare o-ring"
-    def summary_environment(self):
+    def outline_environment(self):
         lube = "lubed" if self.lubricated else "dry"
         return (
             f"{self.name} ({self.seal_name()})\n"
             f"  material        {self.material} {self.hardness}A, {lube}\n"
             f"  pressure diff   {fmt_bar(self.DP)}\n"
         )
-    def summary_dimensions(self):
+    def outline_dimensions(self):
         return (
             "  --\n"
             "  oring (IDxCS)   "
@@ -268,47 +294,44 @@ class Oring(ABC):
                 f"{fmt_mm(self.gland_ID)} / {fmt_mm(self.gland_OD)}\n"
             "  gland (WxD)     "
                 f"{fmt_mm(self.gland_width)} x {fmt_mm(self.gland_depth)}\n"
-            f"  effective CS    {fmt_mm(self.effective_CS())}\n"
+            f"  effective CS    {fmt_mm(self.effective_CS)}\n"
         )
-    def summary_fit(self):
+    def outline_fit(self):
         return (
             "  --\n"
-            f"  squeeze         {fmt_pt(self.squeeze())} (aim 10--20%)\n"
-            f"  gland fill      {fmt_pt(self.gland_fill())} (aim 60--80%)\n"
+            f"  squeeze         {fmt_pt(self.squeeze)} (aim 10--20%)\n"
+            f"  gland fill      {fmt_pt(self.gland_fill)} (aim 60--80%)\n"
         )
-    def summary_contact(self):
-        peak_stress = self.contact_peak_stress()
+    def outline_contact(self):
         return (
             "  --\n"
-            f"  contact load    {fmt_num(self.q_normal_squeeze()*1e-3)} N/mm\n"
-            f"  contact width   {fmt_mm(self.contact_width())}\n"
-            f"  peak stress     {fmt_MPa(peak_stress)} + ~DP = "
-                f"~{fmt_MPa(peak_stress + self.DP)}\n"
+            f"  contact load    {fmt_num(self.q_normal_squeeze*1e-3)} N/mm\n"
+            f"  contact width   {fmt_mm(self.contact_width)}\n"
+            f"  peak stress     {fmt_MPa(self.contact_peak_stress)} + ~DP = "
+                f"~{fmt_MPa(self.contact_peak_stress + self.DP)}\n"
         )
-    def summary_forces(self):
+    def outline_forces(self):
         return "  --\n"
-    def summary(self):
+    def outline(self, printed=True):
         warnings = ""
         checks = self.checks()
         if checks:
             warnings = "  --\n"
             warnings += "".join(f"  !! {warning}\n" for warning in checks)
-        return "".join([
-            self.summary_environment(),
-            self.summary_dimensions(),
-            self.summary_fit(),
-            self.summary_contact(),
-            self.summary_forces(),
+        s = "".join([
+            self.outline_environment(),
+            self.outline_dimensions(),
+            self.outline_fit(),
+            self.outline_contact(),
+            self.outline_forces(),
             warnings
         ])
-    def report(self, *args, **kwargs):
-        print(self.summary(*args, **kwargs))
+        if printed:
+            print(s)
+        return s
 
     def __repr__(self):
         return f"<o-ring {self.name!r}>"
-
-class ExceptionStaticSeal(Exception):
-    pass
 
 
 
@@ -328,16 +351,18 @@ class RadialSeal(Oring):
     @abstractmethod
     def kind(self): ...
 
-    @property
-    def gland_depth(self):
-        return self.gland_Lr
-    @property
-    def gland_width(self):
-        return self.gland_Lz
-    @property
-    def contact_D(self):
-        return self.gland_OD if self.kind == "piston" else self.gland_ID
+    gland_depth = calc(u.mm, # Sets the groove root (gland_ID for a piston,
+                             # gland_OD for a rod), keeping the sliding surface.
+        lambda s: s.gland_Lr,
+        lambda s, d: dict(gland_ID=s.gland_OD - 2*d) if s.kind == "piston"
+                else dict(gland_OD=s.gland_ID + 2*d))
+    gland_width = calc(u.mm,
+        lambda s: s.gland_Lz,
+        lambda s, w: dict(gland_Lz=w))
+    contact_D = calc(u.mm, # The sliding surface.
+        lambda s: s.gland_OD if s.kind == "piston" else s.gland_ID)
 
+    @computed(u.mm)
     def effective_MD(self):
         # Squeezed between both gland walls, the cross-section is flattened
         # symmetrically, so its centroid sits at the gland mid-diameter.
@@ -361,9 +386,19 @@ class RadialSeal(Oring):
             CS = self.oring_CS * sqrt(self.oring_MD / MD)
         return MD
 
+
+    # ---- Friction (along the sliding direction) -------------------------------
+
+    F_friction_running = calc(u.N,
+        lambda s: s.mu_running * s.F_normal_squeeze
+                + s.mu_pressure * s.F_normal_pressure)
+    F_friction_breakaway = calc(u.N,
+        lambda s: s.mu_breakaway * s.F_normal)
+
+
     def checks(self):
         warnings = super().checks()
-        s = self.squeeze()
+        s = self.squeeze
         if s < self.squeeze_min_dynamic:
             warnings.append(f"squeeze below {fmt_pt(self.squeeze_min_dynamic)} "
                     "- O-ring may roll in the gland; "
@@ -383,23 +418,23 @@ class RadialSeal(Oring):
 
     def seal_name(self):
         return f"{self.kind} seal"
-    def summary_fit(self):
-        return super().summary_fit() + (
-            (f"  ID stretch      {fmt_pt(self.ID_stretch())} (aim 1--5%)\n"
+    def outline_fit(self):
+        return super().outline_fit() + (
+            (f"  ID stretch      {fmt_pt(self.ID_stretch)} (aim 1--5%)\n"
                 if self.kind == "piston" else
-            f"  OD compression  {fmt_pt(self.OD_compression())} (aim 1--3%)\n")
+            f"  OD compression  {fmt_pt(self.OD_compression)} (aim 1--3%)\n")
         )
-    def summary_forces(self):
-        Fr = self.F_friction_running
-        Fb = self.F_friction_breakaway
-        return super().summary_forces() + (
-            f"  F_normal        {fmt_N(self.F_normal())} "
-                f"(squeeze {fmt_N(self.F_normal_squeeze())} + "
-                f"pressure {fmt_N(self.F_normal_pressure())})\n"
-            f"  F_fric breakaway  {fmt_N(Fb(NOM))} "
-                    f"({fmt_N(Fb(LOW))[:-2]}--{fmt_N(Fb(HIGH))})\n"
-            f"  F_fric running  {fmt_N(Fr(NOM))} "
-                    f"({fmt_N(Fr(LOW))[:-2]}--{fmt_N(Fr(HIGH))})\n"
+    def outline_forces(self):
+        lo = self.tweak(friction_level=LOW)
+        hi = self.tweak(friction_level=HIGH)
+        Fb = lambda o: fmt_N(o.F_friction_breakaway)
+        Fr = lambda o: fmt_N(o.F_friction_running)
+        return super().outline_forces() + (
+            f"  F_normal        {fmt_N(self.F_normal)} "
+                f"(squeeze {fmt_N(self.F_normal_squeeze)} + "
+                f"pressure {fmt_N(self.F_normal_pressure)})\n"
+            f"  F_fric breakaway  {Fb(self)} ({Fb(lo)[:-2]}--{Fb(hi)})\n"
+            f"  F_fric running  {Fr(self)} ({Fr(lo)[:-2]}--{Fr(hi)})\n"
         )
 
 
@@ -446,16 +481,18 @@ class FaceSeal(Oring):
     @abstractmethod
     def kind(self): ...
 
-    @property
-    def gland_depth(self):
-        return self.gland_Lz
-    @property
-    def gland_width(self):
-        return self.gland_Lr
-    @property
-    def contact_D(self):
-        return self.effective_MD()
+    gland_depth = calc(u.mm,
+        lambda s: s.gland_Lz,
+        lambda s, d: dict(gland_Lz=d))
+    gland_width = calc(u.mm, # Keeps the wall the O-ring is pressed onto
+                             # (gland_OD internal, gland_ID external).
+        lambda s: s.gland_Lr,
+        lambda s, w: dict(gland_ID=s.gland_OD - 2*w) if s.kind == "internal"
+                else dict(gland_OD=s.gland_ID + 2*w))
+    contact_D = calc(u.mm,
+        lambda s: s.effective_MD)
 
+    @computed(u.mm)
     def effective_MD(self):
         CS = self.oring_CS
         for _ in range(40):
@@ -469,24 +506,21 @@ class FaceSeal(Oring):
             CS = self.oring_CS * sqrt(self.oring_MD / MD)
         return MD
 
-    def F_axial_closure(self):
-        return self.F_normal_squeeze()
+    F_axial_closure = calc(u.N,
+        lambda s: s.F_normal_squeeze)
+    @computed(u.N)
     def F_axial_pressure(self):
         # Assume a worst-case loading.
         D = self.gland_OD if self.kind == "internal" else self.gland_ID
         return self.DP * pi/4 * D**2
+    @computed(u.N)
     def F_axial(self):
         direction = +1 if self.kind == "internal" else -1
-        return self.F_axial_closure() + direction*self.F_axial_pressure()
-
-    def F_friction_running(self, level=NOM):
-        raise ExceptionStaticSeal()
-    def F_friction_breakaway(self, level=NOM):
-        raise ExceptionStaticSeal()
+        return self.F_axial_closure + direction*self.F_axial_pressure
 
     def checks(self):
         warnings = super().checks()
-        if self.gland_width < self.effective_CS():
+        if self.gland_width < self.effective_CS:
             warnings.append("gland narrower than the O-ring CS "
                     "- no room to flatten")
         if self.kind == "internal":
@@ -500,22 +534,22 @@ class FaceSeal(Oring):
 
     def seal_name(self):
         return f"{self.kind} face seal"
-    def summary_dimensions(self):
-        return super().summary_dimensions() + (
-            f"  effective MD    {fmt_mm(self.effective_MD())}\n"
+    def outline_dimensions(self):
+        return super().outline_dimensions() + (
+            f"  effective MD    {fmt_mm(self.effective_MD)}\n"
         )
-    def summary_fit(self):
-        return super().summary_fit() + (
-            (f"  OD compression  {fmt_pt(self.OD_compression())} (aim 1--3%)\n"
+    def outline_fit(self):
+        return super().outline_fit() + (
+            (f"  OD compression  {fmt_pt(self.OD_compression)} (aim 1--3%)\n"
                 if self.kind == "internal" else
-            f"  ID stretch      {fmt_pt(self.ID_stretch())} (aim 1--5%)\n")
+            f"  ID stretch      {fmt_pt(self.ID_stretch)} (aim 1--5%)\n")
         )
-    def summary_forces(self):
-        return super().summary_forces() + (
-            (f"  F_axial clamp   {fmt_N(self.F_axial_closure())} + pressure = "
-                    f"{fmt_N(self.F_axial())} (upper-bound)\n"
+    def outline_forces(self):
+        return super().outline_forces() + (
+            (f"  F_axial clamp   {fmt_N(self.F_axial_closure)} + pressure = "
+                    f"{fmt_N(self.F_axial)} (upper-bound)\n"
                 if self.kind == "internal" else
-            f"  F_axial clamp   {fmt_N(self.F_axial_closure())} - pressure = "
+            f"  F_axial clamp   {fmt_N(self.F_axial_closure)} - pressure = "
                     "geom-dependent\n")
         )
 

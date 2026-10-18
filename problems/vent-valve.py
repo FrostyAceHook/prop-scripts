@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utility"))
 import travel
 import units as u
 from oring import PistonSeal, RodSeal
-from system import System, calc, derived
+from system import System, calc, derived, computed
 
 
 SQRT2 = sqrt(2)
@@ -116,9 +116,9 @@ class VentValve(System):
     # --- friction ---
     orings: tuple # List of o-rings.
     F_fric_running = calc(u.N, # Net sliding friction.
-        lambda s: sum(o.F_friction_running() for o in s.orings))
+        lambda s: sum(o.F_friction_running for o in s.orings))
     F_fric_breakaway = calc(u.N, # Net static friction.
-        lambda s: sum(o.F_friction_breakaway() for o in s.orings))
+        lambda s: sum(o.F_friction_breakaway for o in s.orings))
 
 
     # --- force balances (+ve margin = works) ---
@@ -161,16 +161,29 @@ class VentValve(System):
 
 
     # --- dynamics ---
-    def _forces(s, opening=True):
-        P_tank = s.Pmin_tank if opening else s.Pmax_tank
+    stroke_t_open = calc(u.ms, lambda s: s.opening.stroke_time or inf)
+    t_open = calc(u.ms, lambda s: s.opening.t_impact or inf)
+    t_crack_open = calc(u.ms, lambda s: s.opening.t_start or inf)
+    v_impact_open = calc(u.m_s, lambda s: abs(s.opening.v_impact or nan))
+    E_impact_open = calc(u.J, lambda s: s.opening.E_impact or nan)
+
+    stroke_t_close = calc(u.ms, lambda s: s.closing.stroke_time or inf)
+    t_close = calc(u.ms, lambda s: s.closing.t_impact or inf)
+    t_crack_close = calc(u.ms, lambda s: s.closing.t_start or inf)
+    v_impact_close = calc(u.m_s, lambda s: abs(s.closing.v_impact or nan))
+    E_impact_close = calc(u.J, lambda s: s.closing.E_impact or nan)
+
+
+    def _forces(s, is_opening=True):
+        P_tank = s.Pmin_tank if is_opening else s.Pmax_tank
         def tank(t, x, v):
             t = min(max(x/s.chi_seat, 0.0), 1.0)
             return P_tank * (s.A_seat + t * (s.A_ball - s.A_seat))
         def pneumo(t, x, v):
-            if opening:
-                return -s.F_pneumo * exp(-t/s.tau_fill)
+            if is_opening:
+                return -s.F_pneumo * exp(-t/s.tau_vent)
             else:
-                return -s.F_pneumo * (1.0 - exp(-t/s.tau_vent))
+                return -s.F_pneumo * (1.0 - exp(-t/s.tau_fill))
         def spring(t, x, v):
             return s.F_spring(x)
         @travel.Friction
@@ -199,10 +212,8 @@ class VentValve(System):
         opts.update(kw)
         return travel.travel(self._forces(direction == "open"), **opts)
 
-    def opening(self):
-        return self.travel("open")
-    def closing(self):
-        return self.travel("close")
+    opening = computed(None)(lambda s: s.travel("open"))
+    closing = computed(None)(lambda s: s.travel("close"))
 
 
     def venting(self, V=11e-3, m0=8.0, T0=278.15):
@@ -275,15 +286,15 @@ class VentValve(System):
 
 
     def plot(self):
-        return self.opening().plot(), self.closing().plot(), self.venting()
+        return self.opening.plot(), self.closing.plot(), self.venting()
 
 
 
 def main():
     valve = VentValve(
         m=0.01936269 + 0.0089/3, stroke=1.5e-3,
-        chi_seat=0.3e-3, tau_fill=20e-3, tau_vent=20e-3,
-        sim_dt=0.01e-3, sim_t_end=200e-3,
+        chi_seat=0.3e-3, tau_fill=5e-3, tau_vent=5e-3,
+        sim_dt=0.001e-3, sim_t_end=200e-3,
         Pmin_tank=0.0, Pmax_tank=70e5, D_ball=6e-3,
         D_seat_bore=2e-3, D_plunger_bore=7e-3,
         P_pneumo=10e5, D_pneumo=31.5e-3,

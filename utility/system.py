@@ -197,7 +197,8 @@ def derived(unit, source, forward, inverse=None, *, cache=True, doc=None):
     Settable output if `inverse` is given.
     """
     fset = (lambda s, v: {source: inverse(v)}) if inverse else None
-    return calc(unit, lambda s: forward(getattr(s, source)), fset, cache=cache, doc=doc)
+    return calc(unit, lambda s: forward(getattr(s, source)), fset, cache=cache,
+            doc=doc)
 
 def computed(unit):
     """
