@@ -6,23 +6,16 @@ from abc import ABC, abstractmethod
 from math import pi, sqrt, floor, log10, erf, isfinite
 
 import units as u
+from fmt import fmt_num, fmt_mm, fmt_bar, fmt_MPa, fmt_N, fmt_pt
 from system import System, calc, computed
 
 
-# Formatting helpers.
-def fmt_num(x, sig=4):
-    if not isfinite(x):
-        return str(x)
-    if x == 0:
-        return "0"
-    decimals = max(0, sig - 1 - floor(log10(abs(x))))
-    s = f"{x:.{decimals}f}"
-    return s.rstrip("0").rstrip(".") if "." in s else s
-fmt_mm = lambda x: f"{fmt_num(x*1e3)}mm"
-fmt_bar = lambda x: f"{fmt_num(x*1e-5)} bar"
-fmt_MPa = lambda x: f"{fmt_num(x*1e-6)} MPa"
-fmt_N = lambda x: f"{fmt_num(x, sig=3)} N"
-fmt_pt = lambda x: f"{fmt_num(x*100, sig=3)}%"
+__all__ = (
+    "PistonSeal",
+    "RodSeal",
+    "InternalFaceSeal",
+    "ExternalFaceSeal",
+)
 
 
 # Allowed hardness range [Shore A] for each O-ring material.

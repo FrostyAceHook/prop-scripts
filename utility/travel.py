@@ -7,61 +7,18 @@ from math import inf, nan, floor, log10, isfinite
 from typing import NamedTuple
 
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
-import matplotlib.ticker
+
+from fmt import fmt_num, fmt_mm, fmt_ms, fmt_m_s, style_ax
 
 
 __all__ = (
-    "Friction",
     "Impact",
-    "TravelResult",
-    "travel"
+    "Journey",
+    "Friction",
+    "embark"
 )
 
-
-
-# Formatting helpers.
-def fmt_num(x, sig=4):
-    if not isfinite(x):
-        return str(x)
-    if x == 0:
-        return "0"
-    decimals = max(0, sig - 1 - floor(log10(abs(x))))
-    s = f"{x:.{decimals}f}"
-    return s.rstrip("0").rstrip(".") if "." in s else s
-fmt_mm = lambda x: f"{fmt_num(x*1e3)}mm"
-fmt_ms = lambda x: f"{fmt_num(x*1e3)} ms"
-fmt_m_s = lambda x: f"{fmt_num(x)} m/s"
-fmt_N = lambda x: f"{fmt_num(x, sig=3)} N"
-fmt_pt = lambda x: f"{fmt_num(x*100, sig=3)}%"
-
-
-
-def style_ax(ax):
-    ax.xaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
-    ax.yaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
-    ax.grid(True, axis="both", which="major", lw=1.0, ls="-", alpha=0.8)
-    ax.grid(True, axis="both", which="minor", lw=0.6, ls="--", alpha=0.5)
-
-
-
-
-def _fn(p):
-    # Wrap a constant as f(t, x, v) so any input can be a number or a function.
-    return p if callable(p) else (lambda t, x, v, _p=float(p): _p)
-
-
-class Friction:
-    """
-    Marks a force as friction. Give its magnitude (>= 0) as a number or
-    f(t, x, v). The solver applies it against the motion, or as a holding force
-    up to this magnitude while stopped. While stuck it is called with v == 0
-    exactly, so return the breakaway value there, e.g.
-    lambda t, x, v: <breakaway> if v == 0 else <running>.
-    """
-    def __init__(self, magnitude):
-        self.fn = _fn(magnitude)
 
 @dataclass(frozen=True, slots=True)
 class Impact:
@@ -72,7 +29,7 @@ class Impact:
 
 
 @dataclass(eq=False)
-class TravelResult:
+class Journey:
     title: str # cosmetic title
     x_min: float # [m] lower hard stop position
     x_max: float # [m] upper hard stop position
@@ -145,7 +102,7 @@ class TravelResult:
         return "\n".join(lines)
 
     def __repr__(self):
-        return f"<travel {self.title!r}>"
+        return f"<journey {self.title!r}>"
 
     def __str__(self):
         return self.summary()
@@ -185,25 +142,13 @@ class TravelResult:
         axes[1].axhline(0, c="black", lw=1.0)
         axes[1].set_ylabel("Velocity [m/s]")
 
-
-        # axes[2].plot(t, F_drive, label=tag("driving"))
-        # axes[2].plot(t, F_frictional, label=tag("frictional"))
-        # F_net = np.copysign(
-        #     np.maximum(np.abs(F_drive) - np.abs(F_frictional), 0),
-        #     F_drive
-        # )
-        # axes[2].plot(t, F_net, label=tag("net"))
-        # axes[2].axhline(0, c="black", lw=1.0)
-        # axes[2].set_ylabel("Force [N]")
-        # axes[2].legend()
-
         for name, arr in forces.items():
             ls = "--" if name in self.frictions else "-"
-            axes[-1].plot(t, arr, ls=ls, label=tag(name))
-        axes[-1].axhline(0, c="black", lw=1.0)
-        axes[-1].set_ylabel("Force [N]")
-        axes[-1].set_xlabel("Time [ms]")
-        axes[-1].legend()
+            axes[2].plot(t, arr, ls=ls, label=tag(name))
+        axes[2].axhline(0, c="black", lw=1.0)
+        axes[2].set_ylabel("Force [N]")
+        axes[2].set_xlabel("Time [ms]")
+        axes[2].legend()
 
         for ax in axes:
             ax.set_xlim([-0.01*t[-1], 1.01*t[-1]])
@@ -217,9 +162,24 @@ class TravelResult:
 
 
 
-def travel(forces, mass, x0, x_min, x_max, *,
-           v0=0.0, restitution=0.0, dt=10e-6, t_end=0.5, t_after_impact=None,
-           title="Travel"):
+def _fn(p):
+    # Wrap a constant as f(t, x, v) so any input can be a number or a function.
+    return p if callable(p) else (lambda t, x, v, _p=float(p): _p)
+
+class Friction:
+    """
+    Marks a force as friction. Give its magnitude (>= 0) as a number or
+    f(t, x, v). The solver applies it against the motion, or as a holding force
+    up to this magnitude while stopped. While stuck it is called with v == 0
+    exactly, so return the breakaway value there, e.g.
+    lambda t, x, v: <breakaway> if v == 0 else <running>.
+    """
+    def __init__(self, magnitude):
+        self.fn = _fn(magnitude)
+
+def embark(forces, mass, x0, x_min, x_max, *,
+        v0=0.0, restitution=0.0, dt=10e-6, t_end=0.5, t_after_impact=None,
+        title="Journey"):
     """
     Simulate a body moving between two hard stops.
 
@@ -348,7 +308,7 @@ def travel(forces, mass, x0, x_min, x_max, *,
     hist = dict(zip(d_names, d_hist)) | dict(zip(f_names, f_hist))
     F = {name: np.asarray(hist[name]) for name in forces}
 
-    return TravelResult(
+    return Journey(
         title=title,
         x_min=x_min, x_max=x_max,
         t=np.arange(len(xs)) * dt,

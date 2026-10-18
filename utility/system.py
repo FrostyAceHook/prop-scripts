@@ -54,6 +54,15 @@ from functools import cache, cached_property
 from units import unit_of
 
 
+__all__ = (
+    "System",
+    "output",
+    "computed",
+    "calc",
+    "derived",
+)
+
+
 if typing.TYPE_CHECKING or sys.version_info >= (3, 11):
     from typing import dataclass_transform
 else: # For editor/type-checker support.
@@ -153,9 +162,8 @@ class System:
 
 
 class output(property):
-    """
-    A property with a display unit. Cached per instance by default.
-    """
+    """ A property with a display unit. Cached per instance by default. """
+
     def __init__(self, fget=None, fset=None, fdel=None, doc=None, *,
                  unit=None, cache=True):
         super().__init__(fget, fset, fdel, doc)
@@ -186,26 +194,19 @@ class output(property):
     def setter(self, fset):
         return self._copy(fset=fset)
 
+def computed(unit):
+    """ Caching and unit annotation. """
+    return lambda fget: output(fget, unit=unit)
 
 def calc(unit, fget, fset=None, *, cache=True, doc=None):
     """ An output from a getter (and optional setter), with a display unit. """
     return output(fget, fset, doc=doc, unit=unit, cache=cache)
 
 def derived(unit, source, forward, inverse=None, *, cache=True, doc=None):
-    """
-    Helper for an output computed from one input: forward(self.<source>).
-    Settable output if `inverse` is given.
-    """
+    """ An output computed from only one input. """
     fset = (lambda s, v: {source: inverse(v)}) if inverse else None
     return calc(unit, lambda s: forward(getattr(s, source)), fset, cache=cache,
             doc=doc)
-
-def computed(unit):
-    """
-    Decorator form for long getters: @computed(u.N) instead of @property, and
-    caches the result.
-    """
-    return lambda fget: output(fget, unit=unit)
 
 
 

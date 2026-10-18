@@ -13,10 +13,11 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utility"))
 
-import travel
 import units as u
-from oring import PistonSeal, RodSeal
-from system import System, calc, derived, computed
+from fmt import style_ax
+from oring import *
+from system import *
+from travel import *
 
 
 SQRT2 = sqrt(2)
@@ -186,7 +187,7 @@ class VentValve(System):
                 return -s.F_pneumo * (1.0 - exp(-t/s.tau_fill))
         def spring(t, x, v):
             return s.F_spring(x)
-        @travel.Friction
+        @Friction
         def o_ring(t, x, v):
             return s.F_fric_breakaway if v == 0 else s.F_fric_running
         return dict(tank=tank, pneumo=pneumo, spring=spring, o_ring=o_ring)
@@ -210,7 +211,7 @@ class VentValve(System):
             title="Valve opening" if direction == "open" else "Valve closing",
         )
         opts.update(kw)
-        return travel.travel(self._forces(direction == "open"), **opts)
+        return embark(self._forces(direction == "open"), **opts)
 
     opening = computed(None)(lambda s: s.travel("open"))
     closing = computed(None)(lambda s: s.travel("close"))
@@ -275,7 +276,7 @@ class VentValve(System):
         _, axes = plt.subplots(2, 1, figsize=(8, 7), tight_layout=True,
                 sharex=True)
         for ax in axes:
-            travel.style_ax(ax)
+            style_ax(ax)
         axes[0].set_title(f"Venting ({V*1e3}L tank, {m0}kg N2O, {T0-273.15}°C)")
         axes[0].plot(soln.t, mass)
         axes[0].set_ylabel("Mass [kg]")
