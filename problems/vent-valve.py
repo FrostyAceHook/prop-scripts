@@ -178,7 +178,7 @@ class VentValve(System):
             return s.F_fric_breakaway if v == 0 else s.F_fric_running
         return dict(tank=tank, pneumo=pneumo, spring=spring, o_ring=o_ring)
 
-    def simulate(self, direction, **kw):
+    def travel(self, direction, **kw):
         """ Run the travel sim in the given `direction` ("open" or "close"). """
         if direction == "open":
             x0 = 0.0
@@ -200,11 +200,82 @@ class VentValve(System):
         return travel.travel(self._forces(direction == "open"), **opts)
 
     def opening(self):
-        return self.simulate("open")
+        return self.travel("open")
     def closing(self):
-        return self.simulate("close")
+        return self.travel("close")
+
+
+    def venting(self, V=11e-3, m0=8.0, T0=278.15):
+        import numpy as np
+        from CoolProp.CoolProp import PropsSI
+        from scipy.integrate import solve_ivp
+
+        @np.vectorize
+        def N2O(*args, **kwargs):
+            return PropsSI(*args, "N2O", **kwargs)
+
+        Cd = 0.65 # [-]
+        A = self.A_seat_bore # [m^2]
+
+        def mdot_SPC(m, P_u, P_d, T_u, rho, y):
+            # cheeky chat job. looks good tho.
+
+            # 1. Calculate critical pressure ratio (choking point)
+            # This determines if the flow is sonic (choked) or subsonic
+            critical_ratio = (2 / (y + 1))**(y / (y - 1))
+            actual_ratio = P_d / P_u
+
+            # 2. Check for backflow or negligible pressure differential
+            if actual_ratio >= 1.0:
+                return 0.0
+
+            # 4. Determine Flow Regime
+            if actual_ratio <= critical_ratio:
+                # --- CHOKED (SONIC) FLOW ---
+                # The flow has reached Mach 1 at the throat.
+                term = y * (2 / (y + 1))**((y + 1) / (y - 1))
+                mdot = Cd * A * sqrt(P_u * rho * term)
+            else:
+                # --- SUBSONIC FLOW ---
+                # The flow is governed by the pressure differential.
+                factor = (2 / (y - 1))
+                term = (actual_ratio**(2/y)) - (actual_ratio**((y + 1)/y))
+                mdot = Cd * A * sqrt(y * P_u * rho * factor * term)
+            return mdot
+
+        def ode(t, Y):
+            m, T = Y
+            m = max(10e-3, m)
+            rho = m/V
+            P_u = N2O("P", "T", T, "D", rho)
+            P_d = 101325.0 # lowwwwwkey an assumption
+            rhosat = N2O("D", "T", T, "Q", 1)
+            y = 1.27 # maybe?
+            dm = -mdot_SPC(m, P_u, P_d, T, min(rho, rhosat), y)
+            dT = (y - 1) * T * dm/m
+            dT = 0.0 # assume equalizes with environment quickly.
+            return dm, dT
+
+        soln = solve_ivp(ode, t_span=(0, 60*30), max_step=10.0, y0=[m0, T0])
+        mass = soln.y[0]
+        temperature = soln.y[1]
+        pressure = N2O("P", "T", soln.y[1], "D", soln.y[0]/V)
+
+        _, axes = plt.subplots(2, 1, figsize=(8, 7), tight_layout=True,
+                sharex=True)
+        for ax in axes:
+            travel.style_ax(ax)
+        axes[0].set_title(f"Venting ({V*1e3}L tank, {m0}kg N2O, {T0-273.15}°C)")
+        axes[0].plot(soln.t, mass)
+        axes[0].set_ylabel("Mass [kg]")
+        axes[1].plot(soln.t, u.nsi.bar(pressure))
+        axes[1].set_xlabel("Time [s]")
+        axes[1].set_ylabel("Pressure [bar]")
+        return axes
+
+
     def plot(self):
-        return self.opening().plot(), self.closing().plot()
+        return self.opening().plot(), self.closing().plot(), self.venting()
 
 
 
