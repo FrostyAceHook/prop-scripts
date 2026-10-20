@@ -37,9 +37,9 @@ value. Annotate fields and getters' return types with a display unit from
             return dict(A=F / self.P) # setters may set outputs, not just inputs.
 
     p = Piston(D=u.si.mm(30), P=u.si.bar(10), stroke=u.si.mm(5))
-    print(p.summary())  # every input and output, in units
+    p.report()  # every input and output, in units
     p = p.tweak(F=1000) # F -> A -> D: D = 35.68 mm
-    print(p.summary())  # note that `.tweak` returned a new object.
+    p.report()  # note that `.tweak` returned a new object.
     p.tweak(D=u.si.mm(32), swept=u.si.cc(5)) # stroke = 6.217 mm
 """
 
@@ -117,7 +117,7 @@ class System:
             return fmt(value)
         return f"{fmt(unit.nsi(value))} {unit.symbol}"
 
-    def summary(self, outputs=True):
+    def report(self, outputs=True, printed=True):
         """ Every parameter in declaration order; dependants marked with *. """
         inputs = self.inputs()
         names = [n for n in self.parameters() if outputs or n in inputs]
@@ -128,10 +128,11 @@ class System:
         for n in names:
             mark = " " if n in inputs else "-"
             lines.append(f"  {mark} {n:<{width-2}}  {self.display(n)}\n")
-        return "".join(lines)
-    def report(self, *args, **kwargs):
-        """ Prints `.summary()`. """
-        print(self.summary(*args, **kwargs))
+        s = "".join(lines)
+        if printed:
+            print(s)
+        else:
+            return s
 
 
     def tweak(self, **changes):

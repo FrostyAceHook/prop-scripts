@@ -3,11 +3,13 @@ O-ring calculator, for friction as well as stretch/squeeze/gland analysis.
 """
 
 from abc import ABC, abstractmethod
-from math import pi, sqrt, floor, log10, erf, isfinite
+from math import pi, sqrt, log, erf, isfinite
 
 import units as u
 from fmt import fmt_num, fmt_mm, fmt_bar, fmt_MPa, fmt_N, fmt_pt
 from system import System, calc, computed
+from oring_sizes import (OringSize, bs1806, finer, BS1806, FINER_BS,
+        FINER_METRIC)
 
 
 __all__ = (
@@ -16,6 +18,12 @@ __all__ = (
     "InternalFaceSeal",
     "ExternalFaceSeal",
     "OringFriction",
+    "OringSize",
+    "bs1806",
+    "finer",
+    "BS1806",
+    "FINER_BS",
+    "FINER_METRIC",
 )
 
 
@@ -23,6 +31,7 @@ __all__ = (
 HARDNESS_RANGE = {
     "FKM": (70, 90),
     "NBR": (70, 90),
+    "EPDM": (60, 90),
 }
 
 # Friction coefficients against metal, as (low, nominal, high), for
@@ -34,12 +43,18 @@ FRICTION = {
     ("NBR", False): {"running":   (0.50, 0.70, 1.00),
                      "pressure":  (0.50, 0.70, 1.00),
                      "breakaway": (0.80, 1.00, 1.30)},
+    ("EPDM", False): {"running":   (0.45, 0.65, 0.90),
+                      "pressure":  (0.45, 0.65, 0.90),
+                      "breakaway": (0.80, 1.00, 1.30)},
     ("FKM", True):  {"running":   (0.07, 0.12, 0.30),
                      "pressure":  (0.03, 0.05, 0.12),
                      "breakaway": (0.20, 0.35, 0.50)},
     ("NBR", True):  {"running":   (0.07, 0.12, 0.30),
                      "pressure":  (0.03, 0.05, 0.12),
                      "breakaway": (0.20, 0.35, 0.50)},
+    ("EPDM", True):  {"running":   (0.07, 0.12, 0.30),
+                      "pressure":  (0.03, 0.05, 0.12),
+                      "breakaway": (0.20, 0.35, 0.50)},
 }
 LOW, NOM, HIGH = 0, 1, 2
 class OringFriction: # exported on import *.
@@ -69,8 +84,12 @@ class Oring(System, ABC):
     # [-] Gland fill limit.
     gland_fill_max = 0.85
 
-    # [-] Assembly fit limits.
+    # [-] Assembly fit limits and the value auto-sizing aims for.
+    ID_stretch_min = 0.01
+    ID_stretch_target = 0.02
     ID_stretch_max = 0.05
+    OD_compression_min = 0.01
+    OD_compression_target = 0.02
     OD_compression_max = 0.03
 
     name: str # Cosmetic name.
@@ -84,6 +103,7 @@ class Oring(System, ABC):
     hardness: u.shoreA
     lubricated: bool
     friction_level: int = NOM # Which friction coefficients: LOW, NOM or HIGH.
+    oring_ref: str = "" # Cosmetic size reference, e.g. "BS214".
 
     def __init_subclass__(cls, **options):
         # Keep the short `__repr__` below for every seal type, rather than the
@@ -91,6 +111,12 @@ class Oring(System, ABC):
         super().__init_subclass__(**{"repr": False, **options})
 
     def __post_init__(self):
+        for v in (self.oring_ID, self.oring_CS, self.gland_ID, self.gland_OD,
+                self.gland_Lz, self.DP, self.hardness):
+            if not isfinite(v):
+                raise ValueError("inputs must be finite numbers")
+        if not isinstance(self.lubricated, bool):
+            raise ValueError("lubricated must be True or False")
         if self.material not in HARDNESS_RANGE:
             raise ValueError(f"material must be one of {list(HARDNESS_RANGE)}")
         low, high = HARDNESS_RANGE[self.material]
@@ -105,12 +131,9 @@ class Oring(System, ABC):
             raise ValueError("gland_Lz must be positive")
         if self.DP < 0:
             raise ValueError("DP must be zero or positive")
-        if self.friction_level not in (LOW, NOM, HIGH):
+        if (isinstance(self.friction_level, bool)
+                or self.friction_level not in (LOW, NOM, HIGH)):
             raise ValueError("friction_level must be LOW, NOM or HIGH")
-        for v in (self.oring_ID, self.oring_CS, self.gland_ID, self.gland_OD,
-                self.gland_Lz, self.DP, self.hardness):
-            if not isfinite(v):
-                raise ValueError("inputs must be finite numbers")
 
 
     # ---- O-ring and gland geometry ---------------------------------------
@@ -236,6 +259,99 @@ class Oring(System, ABC):
         lambda s: s.F_normal_squeeze + s.F_normal_pressure)
 
 
+    # ---- Auto-sizing ----------------------------------------------------------
+    #
+    # For every standard O-ring: build a rough gland (_auto_start), let .tweak
+    # set the squeeze and then the gland fill (the setters move only the walls
+    # they should), optionally round the machined dimensions, then keep the
+    # result if it is acceptable (_auto_ok) and rank it (_auto_rank).
+    #   Radial seals: the bore or rod is given. The ring is chosen by its
+    #     assembly fit, ranked by closeness to the fit target.
+    #   Face seals: the groove walls are free, so the groove is placed around
+    #     each ring at the fit target; the given diameter is the opening the
+    #     seal must go around (minimum groove ID). Smallest seal wins.
+
+    # Gland wall given by the user, never rounded. None if all are free.
+    given_wall = None
+
+    # Rule-of-thumb CS grows with the sealing diameter D, roughly as sqrt(D):
+    # CS ~ 0.42 sqrt(D), both in mm, with a floor. This follows the usual
+    # pairings (1.78 mm around 10-20 mm, 2.62 mm around 25-45 mm, 3.53 mm around
+    # 50-90 mm, 5.33 mm around 120-250 mm). Thinner rings are fragile and
+    # tolerance-sensitive. Thicker rings add friction and bulk.
+    CS_pref_k = 0.42 # [mm^0.5]
+    CS_pref_min = 0.5e-3  # [m]
+
+    @classmethod
+    def preferred_CS(cls, D):
+        return max(cls.CS_pref_k * sqrt(D*1e3) * 1e-3, cls.CS_pref_min)
+
+    def squeeze_range(self, CS_tol, machining_tol):
+        """
+        Worst-case (lowest, highest) squeeze for an O-ring CS tolerance and a
+        +/- tolerance on the gland depth.
+        """
+        CS = self.effective_CS
+        dCS = CS_tol * CS / self.oring_CS
+        lo = 1 - (self.gland_depth + machining_tol) / (CS - dCS)
+        hi = 1 - (self.gland_depth - machining_tol) / (CS + dCS)
+        return max(0.0, lo), hi
+
+    @abstractmethod
+    def assembly_fit(self): ...
+        # (value, low limit, high limit, target) of the fit that picks the ring.
+
+    @classmethod
+    @abstractmethod
+    def _auto_start(cls, D, size, squeeze): ...
+        # Rough gland for O-ring `size`, as field kwargs, or None if this ring
+        # cannot work. Only a starting point for the tweaks.
+    def _auto_ok(self, D):
+        value, lo, hi, _ = self.assembly_fit()
+        return lo <= value <= hi and self.squeeze > 0
+    @abstractmethod
+    def _auto_rank(self): ... # Minimised.
+    @classmethod
+    def _auto(cls, name, D, squeeze, gland_fill, *, CS=None,
+            sizes=FINER_BS+FINER_METRIC, round_to=None, all_options=False,
+            **seal):
+        options = []
+        for size in sizes:
+            if CS is not None and abs(size.CS - CS) > 0.01e-3:
+                continue
+            start = cls._auto_start(D, size, squeeze)
+            if start is None:
+                continue
+            try:
+                o = cls(name=name, oring_ID=size.ID, oring_CS=size.CS,
+                        oring_ref=size.ref, **start, **seal)
+                o = o.tweak(squeeze=squeeze).tweak(gland_fill=gland_fill)
+                if round_to:
+                    o = o.tweak(**{k: round(getattr(o, k) / round_to) * round_to
+                            for k in ("gland_ID", "gland_OD", "gland_Lz")
+                            if k != cls.given_wall})
+            except ValueError: # this ring cannot make a valid gland here
+                continue
+            if o._auto_ok(D):
+                options.append(o)
+        # Rank: CS closest to the preferred CS, then catalogue-unstarred rings,
+        # then the seal type's own ranking (fit, or smallest seal).
+        CS_pref = cls.preferred_CS(D)
+        options.sort(key=lambda o: (
+                round(abs(log(o.oring_CS / CS_pref)), 6),
+                o.oring_ref.endswith("*"),
+                o._auto_rank()
+            ))
+        if all_options:
+            return options
+        if not options:
+            raise ValueError(f"no standard O-ring fits this {cls.__name__} "
+                    f"(D = {fmt_mm(D)}, squeeze {fmt_pt(squeeze)}, gland fill "
+                    f"{fmt_pt(gland_fill)}{f', CS {fmt_mm(CS)}' if CS else ''})"
+                    "; try another CS or squeeze")
+        return options[0]
+
+
     # ---- Checks ---------------------------------------------------------------
 
     def checks_ID_stretch(self, loose_message):
@@ -279,13 +395,15 @@ class Oring(System, ABC):
         lube = "lubed" if self.lubricated else "dry"
         return (
             f"{self.name} ({self.seal_name()})\n"
-            f"  material        {self.material} {self.hardness}A, {lube}\n"
+            f"  material        {self.material} {fmt_num(self.hardness, 3)}A, "
+                f"{lube}\n"
             f"  pressure diff   {fmt_bar(self.DP)}\n"
         )
     def outline_dimensions(self):
         return (
             "  --\n"
             "  oring (IDxCS)   "
+                f"{self.oring_ref + ' ' if self.oring_ref else ''}"
                 f"{fmt_mm(self.oring_ID)} x {fmt_mm(self.oring_CS)}\n"
             "  gland (ID/OD)   "
                 f"{fmt_mm(self.gland_ID)} / {fmt_mm(self.gland_OD)}\n"
@@ -325,7 +443,8 @@ class Oring(System, ABC):
         ])
         if printed:
             print(s)
-        return s
+        else:
+            return s
 
     def __repr__(self):
         return f"<o-ring {self.name!r}>"
@@ -358,6 +477,35 @@ class RadialSeal(Oring):
         lambda s, w: dict(gland_Lz=w))
     contact_D = calc(u.mm, # The sliding surface.
         lambda s: s.gland_OD if s.kind == "piston" else s.gland_ID)
+
+    def assembly_fit(self):
+        # The O-ring grips the groove root, i.e. the part it does not slide
+        # on: stretched onto it (piston), or compressed into it (rod).
+        return (
+            (self.ID_stretch, self.ID_stretch_min, self.ID_stretch_max,
+              self.ID_stretch_target)
+            if self.kind == "piston" else
+            (self.OD_compression, self.OD_compression_min,
+                self.OD_compression_max, self.OD_compression_target)
+        )
+
+    @classmethod
+    def _auto_start(cls, D, size, squeeze):
+        depth = size.CS * (1 - squeeze)
+        if cls.kind == "piston":
+            ID, OD = D - 2*depth, D
+        else:
+            ID, OD = D, D + 2*depth
+        if ID <= 0:
+            return None
+        # Skip rings nowhere near fitting.
+        fit = ID/size.ID - 1 if cls.kind == "piston" else 1 - OD/size.OD
+        if not -0.03 <= fit <= 0.08:
+            return None
+        return dict(gland_ID=ID, gland_OD=OD, gland_Lz=1.5*size.CS)
+    def _auto_rank(self):
+        value, _, _, target = self.assembly_fit()
+        return abs(value - target)
 
     @computed(u.mm)
     def effective_MD(self):
@@ -417,9 +565,13 @@ class RadialSeal(Oring):
         return f"{self.kind} seal"
     def outline_fit(self):
         return super().outline_fit() + (
-            (f"  ID stretch      {fmt_pt(self.ID_stretch)} (aim 1--5%)\n"
+            (f"  ID stretch      {fmt_pt(self.ID_stretch)} "
+                f"(aim {fmt_pt(self.ID_stretch_min)[:-1]}--"
+                f"{fmt_pt(self.ID_stretch_max)})\n"
                 if self.kind == "piston" else
-            f"  OD compression  {fmt_pt(self.OD_compression)} (aim 1--3%)\n")
+            f"  OD compression  {fmt_pt(self.OD_compression)} "
+                f"(aim {fmt_pt(self.OD_compression_min)[:-1]}--"
+                f"{fmt_pt(self.OD_compression_max)})\n")
         )
     def outline_forces(self):
         lo = self.tweak(friction_level=LOW)
@@ -445,6 +597,11 @@ class PistonSeal(RadialSeal):
     Fit check: ID stretch onto the groove root.
     """
     kind = "piston"
+    given_wall = "gland_OD"
+
+    @classmethod
+    def auto(cls, name, bore_D, squeeze, gland_fill, **kwargs):
+        return cls._auto(name, bore_D, squeeze, gland_fill, **kwargs)
 
 class RodSeal(RadialSeal):
     """
@@ -456,6 +613,17 @@ class RodSeal(RadialSeal):
     Fit check: OD compression into the groove root.
     """
     kind = "rod"
+    given_wall = "gland_ID"
+
+    # Slightly tweaked OD compression limits (especially for small orings).
+    OD_compression_min = 0.005
+    @property
+    def OD_compression_max(self):
+        return 0.05 if self.oring_ID < 250e-3 else 0.03
+
+    @classmethod
+    def auto(cls, name, rod_D, squeeze, gland_fill, **kwargs):
+        return cls._auto(name, rod_D, squeeze, gland_fill, **kwargs)
 
 
 
@@ -488,6 +656,32 @@ class FaceSeal(Oring):
                 else dict(gland_OD=s.gland_ID + 2*w))
     contact_D = calc(u.mm,
         lambda s: s.effective_MD)
+
+    def assembly_fit(self):
+        if self.kind == "internal":
+            return (self.OD_compression, self.OD_compression_min,
+                    self.OD_compression_max, self.OD_compression_target)
+        return (self.ID_stretch, self.ID_stretch_min, self.ID_stretch_max,
+                self.ID_stretch_target)
+
+    @classmethod
+    def _auto_start(cls, D, size, squeeze):
+        # Put the pressure-side wall at the fit target; gland fill then moves
+        # the other wall. Skip rings too small to go around the opening D.
+        width = 1.4 * size.CS
+        if cls.kind == "internal":
+            OD = size.OD * (1 - cls.OD_compression_target)
+            ID = OD - 2*width
+        else:
+            ID = size.ID * (1 + cls.ID_stretch_target)
+            OD = ID + 2*width
+        if ID < D:
+            return None
+        return dict(gland_ID=ID, gland_OD=OD, gland_Lz=size.CS*(1 - squeeze))
+    def _auto_ok(self, D):
+        return super()._auto_ok(D) and self.gland_ID >= D
+    def _auto_rank(self):
+        return self.gland_OD # smallest seal: least pressure force
 
     @computed(u.mm)
     def effective_MD(self):
@@ -556,17 +750,21 @@ class InternalFaceSeal(FaceSeal):
     Pressure on the inside of the O-ring, pushing the O-ring onto the groove OD.
     Pressure acts on the area inside the sealing line, taken as gland_OD (upper
     bound), and pushes the faces apart.
-
-    Fit check: O-ring OD should be 1-3% larger than gland_OD.
     """
     kind = "internal"
+
+    @classmethod
+    def auto(cls, name, min_groove_ID, squeeze, gland_fill, **kwargs):
+        return cls._auto(name, min_groove_ID, squeeze, gland_fill, **kwargs)
 
 class ExternalFaceSeal(FaceSeal):
     """
     Pressure on the outside of the O-ring, pushing the O-ring onto the groove ID.
     Pressure acts on the area inside the sealing line, taken as gland_ID (lower
     bound), and pushes the faces together.
-
-    Fit check: O-ring ID should be stretched 1-5% onto gland_ID.
     """
     kind = "external"
+
+    @classmethod
+    def auto(cls, name, min_groove_ID, squeeze, gland_fill, **kwargs):
+        return cls._auto(name, min_groove_ID, squeeze, gland_fill, **kwargs)
