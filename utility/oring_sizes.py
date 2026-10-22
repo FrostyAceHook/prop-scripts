@@ -11,15 +11,13 @@ FINER_BS, FINER_METRIC: the Viton 75 ranges of Finer Power Transmissions
 ("Seagull" brand, sold by Industrial Shed, AIMS and others). Sources: Finer
 catalogue 4.1.43-49 "BS Series Viton O-Rings" (finerpt.com) and Finer catalogue
 pp 39-43 "Metric Viton Series" (as hosted by AIMS Industrial). Metric codes are
-MOR<ID>X<CS>V. Some metric codes carry a "*" in the catalogue (meaning not stated
-there, possibly non-stock); it is kept in OringSize.note so those sizes can be
-filtered out.
+MOR<ID>X<CS>V.
 """
 
 from dataclasses import dataclass
 
 
-__all__ = ("OringSize", "bs1806", "finer", "BS1860", "FINER_BS", "FINER_METRIC")
+__all__ = ("OringSize", "bs1806", "finer", "BS1806", "FINER_BS", "FINER_METRIC")
 
 
 INCH = 25.4e-3
@@ -173,8 +171,7 @@ def bs1806(ref):
 FINER_BS = tuple(s for s in BS1806 if not
         350 < int(s.ref[2:]) < 425)
 
-# Metric: ID [mm], CS [mm], ID tolerance [mm]; a trailing * marks the
-# catalogue's starred codes. CS tolerance follows from CS.
+# Metric: ID [mm], CS [mm], ID tolerance [mm]. CS tolerance follows from CS.
 _FINER_CS_TOL = {1: 0.07, 1.5: 0.08, 1.6: 0.08, 2: 0.08, 3: 0.09, 4: 0.10,
         5: 0.13, 6: 0.15}
 _FINER_METRIC = """
