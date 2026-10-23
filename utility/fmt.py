@@ -20,7 +20,7 @@ __all__ = (
 
 # ---- Numbers ------------------------------------------------------------------
 
-def fmt_num(x, sig=4):
+def fmt_num(x, sig=5):
     """ `x` to `sig` significant figures, without trailing zeros. """
     if not isfinite(x):
         return str(x)
