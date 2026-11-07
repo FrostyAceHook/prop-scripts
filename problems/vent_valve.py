@@ -118,10 +118,13 @@ class VentValve(System):
         lambda s: s.F_spring(0.0),
         lambda s, F: dict(ell_closed=s.ell_relaxed - F / s.k_spring))
 
-    # ell_solid: u.mm # "Solid" length (for utilisation calc).
-    # spring_utilisation = calc(u.percent, # Fraction of available deflection used
-    #                                      # when closed (keep below ~0.85).
-    #     lambda s: (s.ell_relaxed - s.ell_closed) / (s.ell_relaxed - s.ell_solid))
+    # Generic die-spring limit: compression from free length, as a fraction of
+    # free length. Long-life catalogue figures are roughly 20-30% depending on
+    # grade (heavier grades lower); confirm with the spring maker.
+    max_spring_compression = 0.4 # [-]
+    spring_compression = calc(u.percent,
+        lambda s: (s.ell_relaxed - s.ell_closed) / s.ell_relaxed)
+
 
 
     # --- friction ---
@@ -202,10 +205,8 @@ class VentValve(System):
 
 
     # --- optimisation ---
-    cost = calc(None, lambda s: (s.P_pneumo/1e5)**2
-                              + (s.D_pneumo/5e-3)**2
+    cost = calc(None, lambda s: (s.D_pneumo/5e-3)**2
                               + (s.ell_open/5e-3)**2
-                              + ((s.ell_open - s.ell_relaxed)/5e-3)**2
                             )
 
 
@@ -358,9 +359,9 @@ def main():
         m=0.01936269 + 0.0089/3, stroke=1.5e-3,
         chi_seat=0.3e-3, tau_fill=5e-3, tau_vent=5e-3,
         sim_dt=0.001e-3, sim_t_end=200e-3,
-        Pmin_tank=0.0, Pmax_tank=72e5, D_ball=6e-3,
+        Pmin_tank=0.0, Pmax_tank=70e5, D_ball=6e-3,
         D_seat_bore=2e-3, D_plunger_bore=7e-3,
-        P_pneumo=30e5, D_pneumo=31.5e-3,
+        P_pneumo=10e5, D_pneumo=35e-3,
         k_spring=25.5e3, ell_relaxed=25e-3, ell_open=18.2e-3,
         orings=(
             # NOTE: seal DP values are not dynamically updated.
@@ -379,25 +380,34 @@ def main():
 
     def optimise(sys):
         params = {
-            "D_pneumo": (10e-3, 60e-3),
-            # "P_pneumo": (5e5, 30e5),
+            "D_pneumo": (8e-3, 60e-3),
             "k_spring": (5e3, 150e3),
-            "ell_relaxed": (5e-3, 50e-3),
-            "ell_open": (5e-3, 50e-3),
+            "ell_relaxed": (35e-3, 80e-3),
+            "ell_open": (5e-3, 80e-3),
         }
         constraints = {
-            "worst_margin_hold_open": (20, None),
-            "worst_rmargin_hold_open": (0.1, None),
-            "worst_margin_hold_closed": (20, None),
-            "worst_rmargin_hold_closed": (0.1, None),
-            "worst_margin_close": (80, None),
-            "worst_rmargin_close": (0.1, None),
-            "worst_margin_open": (80, None),
-            "worst_rmargin_open": (0.15, None),
+            # "worst_margin_hold_open": (20, None),
+            # "worst_rmargin_hold_open": (0.1, None),
+            # "worst_margin_hold_closed": (20, None),
+            # "worst_rmargin_hold_closed": (0.1, None),
+            # "worst_margin_close": (80, None),
+            # "worst_rmargin_close": (0.1, None),
+            # "worst_margin_open": (80, None),
+            # "worst_rmargin_open": (0.15, None),
+
+            "margin_hold_open": (40, None),
+            "rmargin_hold_open": (0.3, None),
+            "margin_hold_closed": (40, None),
+            "rmargin_hold_closed": (0.3, None),
+            "margin_close": (150, None),
+            "rmargin_close": (0.3, None),
+            "margin_open": (150, None),
+            "rmargin_open": (0.3, None),
+            "spring_compression": (None, VentValve.max_spring_compression),
         }
         coarse = sys.tweak(sim_dt=0.02e-3)
         opt = search.optimise(coarse, "cost", params, constraints,
-                seed=0, maxiter=30, popsize=10, workers=-1)
+                seed=0, maxiter=30, tol=1e-6, popsize=10, workers=-1)
         opt.report()
         best = opt.system.tweak(sim_dt=sys.sim_dt)
         best.report()
@@ -406,10 +416,12 @@ def main():
 
 
     vv_10barpneumo = vv.tweak(
-            D_pneumo=36e-3,
+            D_pneumo=35e-3, P_pneumo=10e5,
             k_spring=100e3, ell_relaxed=8e-3, ell_open=5.183e-3
         )
-    vv_10barpneumo.report()
+    # vv_10barpneumo.report()
+    # for oring in vv_10barpneumo.orings:
+    #     oring.outline()
 
 
 if __name__ == "__main__":

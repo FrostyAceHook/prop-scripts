@@ -68,12 +68,31 @@ class QuickDisconnect(System):
         lambda s, F: dict(A_pneumo=F/s.P_pneumo))
 
     # --- friction ---
-    orings: tuple # List of dynamic o-rings.
+    orings: tuple = None # O-rings: (tube, piston inner, piston outer)
+    @computed(None)
+    def all_seals(self):
+        if self.orings is not None:
+            return self.orings
+        return (
+            RodSeal.auto("Tube", self.D_tube,
+                    squeeze=0.15, gland_fill=0.7,
+                    DP=self.P_pneumo, CS=1.5e-3,
+                    material="FKM", hardness=75, lubricated=True),
+            RodSeal.auto("Piston inner", self.D_tube,
+                    squeeze=0.125, gland_fill=0.7,
+                    DP=self.P_pneumo, CS=1.5e-3,
+                    material="FKM", hardness=75, lubricated=True),
+            PistonSeal.auto("Piston outer", self.D_pneumo,
+                    squeeze=0.15, gland_fill=0.7,
+                    DP=self.P_pneumo, CS=1.5e-3,
+                    material="FKM", hardness=75, lubricated=True),
+        )
+    dynamic_seals = computed(None)(lambda s: s.all_seals[1:])
+
     F_fric_running = calc(u.N, # Net sliding friction.
-        lambda s: sum(o.F_friction_running for o in s.orings))
+        lambda s: sum(o.F_friction_running for o in s.dynamic_seals))
     F_fric_breakaway = calc(u.N, # Net static friction.
-        lambda s: sum(o.F_friction_breakaway for o in s.orings))
-    seals: tuple # List of static o-rings.
+        lambda s: sum(o.F_friction_breakaway for o in s.dynamic_seals))
 
 
     # --- force balances (+ve margin = works) ---
@@ -82,26 +101,27 @@ class QuickDisconnect(System):
         """ Fractional excess of drive over oppose (safety factor - 1). """
         return drive / oppose - 1 if oppose > 0 else float("inf")
 
-    margin_close = calc(u.N,
+    margin_actuate = calc(u.N,
         lambda s: s.F_pneumo - max(s.F_fric_breakaway, s.F_fric_running)
     )
-    rmargin_close = calc(u.percent,
+    rmargin_actuate = calc(u.percent,
         lambda s: s.excess(s.F_pneumo, max(s.F_fric_breakaway, s.F_fric_running))
     )
 
 
     # --- tolerances ---
     def tolerances(self):
-        seals = lambda level: tuple(o.tweak(friction_level=level)
-                                    for o in self.orings)
         return {
             "P_pneumo": 0.1,
-            "orings": (seals(OringFriction.LOW), seals(OringFriction.HIGH)),
+            "orings": (
+                tuple(o.loose for o in self.all_seals),
+                tuple(o.tight for o in self.all_seals),
+            )
         }
-    worst_margin_close = calc(u.N,
-        lambda s: search.corners(s, "margin_close", s.tolerances()).value)
-    worst_rmargin_close = calc(u.percent,
-        lambda s: search.corners(s, "rmargin_close", s.tolerances()).value)
+    worst_margin_actuate = calc(u.N,
+        lambda s: search.corners(s, "margin_actuate", s.tolerances()).value)
+    worst_rmargin_actuate = calc(u.percent,
+        lambda s: search.corners(s, "rmargin_actuate", s.tolerances()).value)
 
 
     # --- optimisation ---
@@ -112,11 +132,10 @@ class QuickDisconnect(System):
 
     # --- dynamics ---
 
+    crack_time = calc(u.ms,
+        lambda s: _value(s._actuating.t_start, inf))
     stroke_time = calc(u.ms,
         lambda s: _value(s._actuating.stroke_time, inf))
-
-    t_crack_actuate = calc(u.ms,
-        lambda s: _value(s._actuating.t_start, inf))
     t_actuate = calc(u.ms,
         lambda s: _value(s._actuating.t_impact, inf))
     v_impact_actuate = calc(u.m_s,
@@ -133,7 +152,6 @@ class QuickDisconnect(System):
         return dict(pneumo=pneumo, o_ring=o_ring)
 
     def travel(self, **kw):
-        """ Run the travel sim in the given `direction` ("open" or "close"). """
         opts = dict(
             dt=self.sim_dt,
             t_end=self.sim_t_end,
@@ -154,7 +172,7 @@ class QuickDisconnect(System):
 
 
     def plot(self):
-        return self.actuating.plot()
+        return self._actuating.plot()
 
 
 
@@ -165,32 +183,12 @@ def main():
         sim_dt=0.001e-3, sim_t_end=200e-3,
         D_tube=6e-3,
         P_pneumo=10e5, D_pneumo=15.2e-3,
-        orings=(
-            # NOTE: seal DP values are not dynamically updated.
-            RodSeal("Piston inner",
-                oring_ID=6.0e-3, oring_CS=1.5e-3,
-                gland_ID=6.0e-3, gland_OD=8.55e-3, gland_Lz=2e-3,
-                DP=10e5, material="FKM", hardness=75, lubricated=True
-            ),
-            PistonSeal("Piston outer",
-                oring_ID=12.5e-3, oring_CS=1.5e-3,
-                gland_ID=12.78e-3, gland_OD=15.2e-3, gland_Lz=2e-3,
-                DP=10e5, material="FKM", hardness=75, lubricated=True
-            ),
-        ),
-        seals=(
-            RodSeal("Entry",
-                oring_ID=6.0e-3, oring_CS=1.5e-3,
-                gland_ID=6.0e-3, gland_OD=8.55e-3, gland_Lz=2e-3,
-                DP=10e5, material="FKM", hardness=75, lubricated=True
-            ),
-        )
     )
 
     qd.report()
-    for oring in itertools.chain(qd.orings, qd.seals):
-        oring.outline()
-
+    for oring in qd.all_seals:
+        oring.outline(succinct=True)
+    qd.plot()
 
 
 if __name__ == "__main__":
