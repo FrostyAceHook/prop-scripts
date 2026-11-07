@@ -20,7 +20,7 @@ value. Annotate fields and getters' return types with a display unit from
         P: u.bar
         stroke: u.mm
 
-        # 2. derived: an output dependant on only one input.
+        # 2. derived: an output dependant on only one parameter.
         A = derived(u.mm2, "D", circ_area, circ_diam)
 
         # 3. calc: any output (shorter form than property).
@@ -41,14 +41,31 @@ value. Annotate fields and getters' return types with a display unit from
     p = p.tweak(F=1000) # F -> A -> D: D = 35.68 mm
     p.report()  # note that `.tweak` returned a new object.
     p.tweak(D=u.si.mm(32), swept=u.si.cc(5)) # stroke = 6.217 mm
+
+Systems nest: annotate a field with a System subclass, or return one from a
+calc. Every name-taking method accepts a dotted path through the tree:
+
+    class Rig(System):
+        piston: Piston
+        count: int
+        F = calc(u.kN, lambda s: s.count * s.piston.F)
+
+    r = Rig(piston=p, count=4)
+    r["piston.A"]               # fetch, also r.fetch("piston.A")
+    r.display("piston.F")       # "1000 N"
+    r.unit("piston.D")          # mm
+    r.tweak({"piston.P": u.si.bar(20)})   # rebuilds piston, then rig
+    r.report()                  # all members, flattened with dots
 """
 
 import ast
 import dataclasses
 import inspect
+import math
 import sys
 import textwrap
 import typing
+import warnings
 from functools import cache, cached_property
 
 from units import unit_of
@@ -70,6 +87,15 @@ else: # For editor/type-checker support.
         return lambda cls: cls
 
 
+class _hybridmethod:
+    """ Bound to the instance when called on one, else to the class. """
+    def __init__(self, func):
+        self.func = func
+    def __get__(self, obj, objtype=None):
+        target = objtype if obj is None else obj
+        return self.func.__get__(target, type(target))
+
+
 @dataclass_transform(frozen_default=True)
 class System:
     def __init_subclass__(cls, **options):
@@ -78,14 +104,20 @@ class System:
         super().__init_subclass__()
         dataclasses.dataclass(cls, **{**options, "frozen": True})
 
-    @classmethod
-    def inputs(cls):
-        """ Names of independent inputs. """
-        return tuple(f.name for f in dataclasses.fields(cls))
 
     @classmethod
-    def outputs(cls):
+    def inputs(cls, deep=False):
+        """ Names of independent inputs. """
+        flat = tuple(f.name for f in dataclasses.fields(cls))
+        return _expand(cls, flat, "inputs") if deep else flat
+
+    @classmethod
+    def outputs(cls, deep=False):
         """ Names of dependent outputs. """
+        if deep:
+            inputs = set(cls.inputs(deep=True))
+            return tuple(n for n in cls.parameters(deep=True)
+                         if n not in inputs)
         names = {}
         for klass in reversed(cls.__mro__):
             for name, attr in vars(klass).items():
@@ -96,38 +128,52 @@ class System:
                 if isinstance(getattr(cls, n), (property, cached_property)))
 
     @classmethod
-    def parameters(cls):
-        """ Names of all inputs and outputs, in declaration order. """
-        return _declaration_order(cls)
+    def parameters(cls, deep=False):
+        """ Names of all inputs and outputs. """
+        flat = _declaration_order(cls)
+        return _expand(cls, flat, "parameters") if deep else flat
 
     @classmethod
-    def settable(cls):
-        """ Names of settable parameters. """
-        return cls.inputs() + tuple(name for name in cls.outputs()
-                if getattr(getattr(cls, name), "fset", None) is not None)
+    def settable(cls, deep=False):
+        """ Names `tweak` accepts: inputs and outputs with a setter. """
+        flat = tuple(n for n in cls.parameters() if cls._settable_here(n))
+        return _expand(cls, flat, "settable") if deep else flat
 
 
     def display(self, name, fmt=lambda x: f"{x:.4g}"):
-        """ Returns a string of the given parameter in its units. """
-        value = getattr(self, name)
-        unit = self.unit(name)
+        """ Returns a string of the given (dotted) parameter in its units. """
+        owner, leaf = self._resolve(name)
+        value = getattr(owner, leaf)
+        if isinstance(value, System):
+            return type(value).__name__
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return repr(value)
+        unit = type(owner).unit(leaf)
         if unit is None:
             return fmt(value)
         return f"{fmt(unit.nsi(value))} {unit.symbol}"
 
+
     def report(self, outputs=True, printed=True):
-        """ Every parameter in declaration order; dependants marked with *. """
-        inputs = self.inputs()
-        names = [n for n in self.parameters() if outputs or n in inputs]
-        width = min(max(map(len, names)) + 2, 18)
+        """ Every parameter in the tree, flattened to dotted paths, in
+        declaration order. Dependants (and anything under one) marked with -.
+        """
+        rows = []
+        for path, owner, leaf, dependent, alias in self._walk(outputs):
+            if alias is not None:
+                text = f"= {alias}"
+            else:
+                try:
+                    text = owner.display(leaf)
+                except Exception as e: # show it, don't kill the report.
+                    text = f"<{type(e).__name__}: {e}>"
+            rows.append((path, "-" if dependent else " ", text))
+        width = min(max((len(p) for p, _, _ in rows), default=0), 36)
         lines = [type(self).__name__ + "\n"]
         if outputs:
             lines.append(" (- dependent)\n")
-        for n in names:
-            mark = " " if n in inputs else "-"
-            lines.append(f"  {mark} {n:<{width-2}}  {self.display(n)}\n")
+        for path, mark, text in rows:
+            lines.append(f"  {mark} {path:<{width}}  {text}\n")
         s = "".join(lines)
         if printed:
             print(s)
@@ -135,31 +181,123 @@ class System:
             return s
 
 
-    def tweak(self, **changes):
+    def tweak(self, changes=None, /, **kwchanges):
         """
         Return a copy with the given inputs or settable outputs changed. Note
         these changes are applied in-order. Setters may themselves return other
-        settable outputs, not just inputs.
+        settable outputs, not just inputs. Names may be dotted paths into sub-
+        systems, through inputs or settable outputs.
         """
+        changes = {**(changes or {}), **kwchanges}
         system = self
         for name, value in changes.items():
+            head, _, rest = name.partition(".")
+            if rest:
+                # Tweak the sub-system, then set it back on this one (a
+                # replace for an input, the setter for an output).
+                if not system._settable_here(head):
+                    raise AttributeError(f"can't tweak {name!r}: "
+                            f"{type(system).__name__}.{head} is an output "
+                            "with no setter")
+                sub = getattr(system, head)
+                if not isinstance(sub, System):
+                    raise AttributeError(f"can't tweak {name!r}: "
+                            f"{type(system).__name__}.{head} is not a System")
+                new = sub.tweak({rest: value})
+                system = system.tweak({head: new})
+                if head not in system.inputs():
+                    # An output's setter might not carry every change back.
+                    got = system.fetch(name)
+                    if not _close(got, new.fetch(rest)):
+                        warnings.warn(f"tweak {name!r}: setter for "
+                            f"{type(system).__name__}.{head} didn't carry the "
+                            f"change through (got {got!r}, wanted "
+                            f"{new.fetch(rest)!r})", stacklevel=2)
+                continue
             if name in system.inputs():
                 system = dataclasses.replace(system, **{name: value})
                 continue
-            prop = getattr(type(system), name, None)
-            if not isinstance(prop, property) or prop.fset is None:
+            if not system._settable_here(name):
                 raise AttributeError(
                     f"{type(system).__name__}.{name} is not settable. "
                     f"Settable: {', '.join(system.settable())}"
                 )
-            system = system.tweak(**prop.fset(system, value))
+            prop = getattr(type(system), name)
+            system = system.tweak(prop.fset(system, value))
         return system
 
-
     @classmethod
-    def unit(cls, name):
-        """ Display unit of a parameter, or None if it isn't annotated. """
-        return _unit_of(cls, name)
+    def _settable_here(cls, name):
+        """ Whether a (non-dotted) name is an input or an output with a
+        setter. """
+        if name in cls.inputs():
+            return True
+        prop = getattr(cls, name, None)
+        return isinstance(prop, property) and prop.fset is not None
+
+
+    @_hybridmethod
+    def unit(self_or_cls, name):
+        """ Display unit of a parameter, or None if it isn't annotated (or is a
+        System). On an instance, sub-system types come from the values; on the
+        class, from annotations, like the listings. """
+        if not isinstance(self_or_cls, type):
+            owner, leaf = self_or_cls._resolve(name)
+            return _unit_of(type(owner), leaf)
+        cls = self_or_cls
+        *parents, leaf = name.split(".")
+        for i, part in enumerate(parents):
+            sub = _system_type_of(cls, part)
+            if sub is None:
+                raise AttributeError(f"{'.'.join(parents[:i+1])!r} is not "
+                                     "declared as a System")
+            cls = sub
+        return _unit_of(cls, leaf)
+
+
+    def fetch(self, name):
+        """ Value at a dotted path, e.g. `s.fetch("load.F")`. """
+        x = self
+        for part in name.split("."):
+            x = getattr(x, part)
+        return x
+    __getitem__ = fetch
+
+
+    def _resolve(self, name):
+        """ (owning system, leaf name) of a dotted path. """
+        parent, _, leaf = name.rpartition(".")
+        owner = self.fetch(parent) if parent else self
+        if not isinstance(owner, System):
+            raise AttributeError(f"{parent!r} is a {type(owner).__name__}, "
+                                 "not a System")
+        return owner, leaf
+
+    def _walk(self, outputs, prefix="", dependent=False, seen=None):
+        """ Yields (path, owner, leaf, dependent, alias) depth-first. `alias`
+        is the first path of an already-visited sub-system, else None. """
+        if seen is None:
+            seen = {id(self): "(self)"}
+        inputs = self.inputs()
+        for n in self.parameters():
+            if not outputs and n not in inputs:
+                continue
+            path = prefix + n
+            dep = dependent or n not in inputs
+            try:
+                value = getattr(self, n)
+            except Exception:
+                value = None # report() will show the error.
+            if isinstance(value, System):
+                if id(value) in seen:
+                    yield path, self, n, dep, seen[id(value)]
+                    continue
+                seen[id(value)] = path
+                yield path, self, n, dep, None
+                yield from value._walk(outputs, path + ".", dep, seen)
+            else:
+                yield path, self, n, dep, None
+
 
 
 class output(property):
@@ -178,11 +316,12 @@ class output(property):
     def __get__(self, obj, objtype=None):
         if obj is None or not self.cache or self.name is None:
             return super().__get__(obj, objtype)
-        try:
-            return obj.__dict__[self.name]
-        except KeyError:
-            value = obj.__dict__[self.name] = self.fget(obj)
-            return value
+        # No try/except: computing inside an except block chains a KeyError
+        # onto every error raised by a (nested) getter.
+        d = obj.__dict__
+        if self.name not in d:
+            d[self.name] = self.fget(obj)
+        return d[self.name]
 
     def _copy(self, **changes):
         kw = dict(fget=self.fget, fset=self.fset, fdel=self.fdel,
@@ -203,28 +342,60 @@ def calc(unit, fget, fset=None, *, cache=True, doc=None):
     """ An output from a getter (and optional setter), with a display unit. """
     return output(fget, fset, doc=doc, unit=unit, cache=cache)
 
-def derived(unit, source, forward, inverse=None, *, cache=True, doc=None):
+def derived(unit, source, derive, inverse=None, *, cache=True, doc=None):
     """ An output computed from only one input. """
     fset = (lambda s, v: {source: inverse(v)}) if inverse else None
-    return calc(unit, lambda s: forward(getattr(s, source)), fset, cache=cache,
+    return calc(unit, lambda s: derive(s.fetch(source)), fset, cache=cache,
             doc=doc)
 
 
 
+def _is_system_type(t):
+    return isinstance(t, type) and issubclass(t, System)
+
+@cache
+def _declared(cls, name):
+    """ What a parameter is declared as: its field annotation, its output's
+    unit, or its getter's return annotation. """
+    if name in cls.inputs():
+        return typing.get_type_hints(cls, include_extras=True).get(name)
+    attr = getattr(cls, name, None)
+    if isinstance(attr, output):
+        return attr.unit
+    fget = getattr(attr, "fget", None) or getattr(attr, "func", None)
+    if fget is None:
+        raise AttributeError(f"{cls.__name__} has no input or output {name!r}")
+    return typing.get_type_hints(fget, include_extras=True).get("return")
+
+@cache
+def _system_type_of(cls, name):
+    """ The System subclass a parameter is declared as, else None. """
+    hint = _declared(cls, name)
+    return hint if _is_system_type(hint) else None
+
 @cache
 def _unit_of(cls, name):
-    if name in cls.inputs():
-        hint = typing.get_type_hints(cls, include_extras=True).get(name)
-    else:
-        attr = getattr(cls, name, None)
-        if isinstance(attr, output):
-            return unit_of(attr.unit)
-        fget = getattr(attr, "fget", None) or getattr(attr, "func", None)
-        if fget is None:
-            raise AttributeError(f"{cls.__name__} has no input or output "
-                                 f"{name!r}")
-        hint = typing.get_type_hints(fget, include_extras=True).get("return")
-    return unit_of(hint)
+    hint = _declared(cls, name)
+    return None if _is_system_type(hint) else unit_of(hint)
+
+def _close(a, b):
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) \
+            and not isinstance(a, bool) and not isinstance(b, bool):
+        return math.isclose(a, b, rel_tol=1e-7, abs_tol=1e-12)
+    return a == b
+
+def _expand(cls, flat, listing, chain=()):
+    """ `flat` names of `cls`, each followed by the dotted deep `listing`
+    (a System classmethod name) of its sub-system type, if it has one. """
+    chain += (cls,)
+    names = []
+    for n in flat:
+        names.append(n)
+        sub = _system_type_of(cls, n)
+        if sub is not None and sub not in chain:
+            sub_flat = getattr(sub, listing)()
+            names += [f"{n}.{m}" for m in _expand(sub, sub_flat, listing, chain)]
+    return tuple(names)
 
 @cache
 def _declaration_order(cls):

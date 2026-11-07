@@ -80,7 +80,7 @@ _ABSZ = 273.15
 
 
 # Dimensionless.
-ratio = Annotated[_Float, None]
+none = Annotated[_Float, None]
 percent = Annotated[_Float, Unit("%", 1e-2)]
 
 # Length.

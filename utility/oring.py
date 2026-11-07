@@ -233,7 +233,7 @@ class Oring(System, ABC):
     @E.setter
     def E(self, E):
         return dict(hardness=100 * erf(3.186e-4 * sqrt(E)))
-    nu = calc(u.ratio, # Poisson's constant.
+    nu = calc(u.none, # Poisson's constant.
         lambda s: 0.5) # essentially/assumed incompressible.
 
     def mu(self, kind):
@@ -241,9 +241,9 @@ class Oring(System, ABC):
         lo, nom, hi = FRICTION[(self.material, self.lubricated)][kind]
         z = self.friction_level
         return nom * ((hi if z > 0 else lo) / nom)**(abs(z) / _ZBOUND)
-    mu_running = calc(u.ratio, lambda s: s.mu("running"))
-    mu_pressure = calc(u.ratio, lambda s: s.mu("pressure"))
-    mu_breakaway = calc(u.ratio, lambda s: s.mu("breakaway"))
+    mu_running = calc(u.none, lambda s: s.mu("running"))
+    mu_pressure = calc(u.none, lambda s: s.mu("pressure"))
+    mu_breakaway = calc(u.none, lambda s: s.mu("breakaway"))
 
 
     # ---- O-ring fit -----------------------------------------------------------
