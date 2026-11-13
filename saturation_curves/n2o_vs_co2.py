@@ -145,7 +145,7 @@ def plotme(ax):
     ax.set_aspect("equal")
     ax.set_xlabel("Temperature [°C]", fontsize=13)
     ax.set_ylabel("Pressure [bar]", fontsize=13)
-    ax.set_title("N2O & CO2 Saturation Pressure", fontsize=14)
+    ax.set_title("N2O & CO2 Phase Plot", fontsize=14)
     ax.legend()
 
     ax.xaxis.set_major_locator(MultipleLocator(5))
@@ -176,7 +176,7 @@ def main():
     plotme(plt.gca())
 
     plt.tight_layout()
-    plt.gcf().savefig("n2o_vs_co2.png")
+    plt.gcf().savefig("TP_N2O_vs_CO2.png")
     plt.show()
 
 

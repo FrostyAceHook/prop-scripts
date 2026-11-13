@@ -11,8 +11,8 @@ def N2O(*args, **kwargs):
     except Exception:
         return float("nan")
 
-ms = [0.1, 0.15, 0.3, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8] # n2o mass.
-V = 1e-3 # tank volume.
+ms = np.linspace(8,10, 11) # n2o mass.
+V = 11e-3 # tank volume.
 
 Tmin = -5
 Tmax = 60
@@ -22,26 +22,15 @@ Pmax = 120
 def props(m):
     T = np.linspace(Tmin+273.15, Tmax+273.15, 200)
     rho = m / V
-
     P = N2O("P", "T", T, "D", rho)
     Psat = N2O("P", "T", T, "Q", 0)
-
     Tcrit = N2O("Tcrit")
     Pcrit = N2O("pcrit")
-
     Psat_ueps = Psat * (1 + 1e-5)
     Psat_deps = Psat * (1 - 1e-5)
     idew = np.nanargmax((P > Psat_ueps) | (P < Psat_deps))
     Tdew = T[idew]
     Pdew = P[idew]
-    # if idew == 0 and not (P[0] > Psat_eps[0]):
-    #     if (P > Psat_eps).any():
-    #         Tdew = T[0]
-    #         Pdew = P[0]
-    #     else:
-    #         Tdew = Tcrit
-    #         Pdew = Pcrit
-
     return {
         "T": T - 273.15,
         "P": P / 1e5,
@@ -71,7 +60,7 @@ def plotme(ax):
     cmap = plt.get_cmap("plasma")
     colors = [cmap(v) for v in np.linspace(0.2, 0.8, len(ms))]
 
-    for m, col in zip(ms, colors):
+    for i, (m, col) in enumerate(zip(ms, colors)):
         p = props(m)
         T = p["T"]
         P = p["P"]
@@ -82,16 +71,11 @@ def plotme(ax):
         Tdew = p["Tdew"]
         Pdew = p["Pdew"]
 
-        plot_P = P.copy()
-        plot_P[~(T > Tdew)] = np.nan
-        idx = (T > Tdew).argmax()
+        idx = (T == Tdew).argmax()
         idx = max(0, idx - 1)
-        plot_P[idx] = P[idx]
-        idx = min(len(P) - 1, idx + 1)
-        plot_P[idx] = P[idx]
-        ax.plot(T, plot_P, color=col, lw=1.5)
+        ax.plot(T[idx:], P[idx:], color=col, lw=1.5)
 
-        t, p, angle = coords_angle(T, P, y=Pmax - 15)
+        t, p, angle = coords_angle(T, P, y=Pmax - (15 if i%2 else 22))
         mstr = f"{m:.2f}".rstrip("0").rstrip(".")
         ax.annotate(f"{mstr} kg",
                 xy=(t, p),
@@ -114,7 +98,8 @@ def plotme(ax):
         )
 
     ax.plot(Tsat, Psat, color="blue", lw=1.5, ls="-")
-    t, p, angle = coords_angle(Tsat, Psat, x=(2+Tmin + Tdew)/2)
+    t, p, angle = coords_angle(Tsat, Psat, x=Tmin + 6)
+    p -= 1.8
     ax.annotate("sat. pressure",
             xy=(t, p),
             rotation=angle,
@@ -158,7 +143,7 @@ def main():
     plotme(plt.gca())
 
     plt.tight_layout()
-    plt.gcf().savefig("n2o_pressure.png")
+    plt.gcf().savefig("TP_N2O.png")
     plt.show()
 
 
