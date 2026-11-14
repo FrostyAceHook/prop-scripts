@@ -36,9 +36,9 @@ class Load(System):
     end: str # "nozzle" or "injector".
     count: int # retainer count.
     P: u.bar # internal pressure.
+    sharing_factor: u.none # multiplier on yield strengths to model imperfect
+                           # load sharing.
     A: u.mm2 # "effective" pressure area.
-    sharing_factor: u.none = 0.85 # knock-down on yield strengths to model
-                                  # imperfect load sharing.
     F = calc(u.kN, # axial force per retainer.
         lambda s: s.F_total/s.count,
         lambda s, F: dict(F_total=F*s.count))
@@ -46,11 +46,12 @@ class Load(System):
         lambda s: s.A*s.P,
         lambda s, F: dict(P=F/s.A))
 
-def injector(count, P, D_seal):
-    return Load(end="injector", count=count, P=P, A=circ_area(D_seal))
+def injector(count, P, D_seal, sharing_factor):
+    return Load(end="injector", count=count, P=P, sharing_factor=sharing_factor,
+            A=circ_area(D_seal))
 
-def nozzle(count, P, D_seal, D_throat, Cf):
-    return Load(end="nozzle", count=count, P=P,
+def nozzle(count, P, D_seal, sharing_factor, D_throat, Cf):
+    return Load(end="nozzle", count=count, P=P, sharing_factor=sharing_factor,
             A=circ_area(D_seal) - Cf*circ_area(D_throat))
 
 
@@ -104,10 +105,10 @@ BOLT_GRADES = {code: (Us*1e6, Ys*1e6)
               for code, (Us, Ys) in BOLT_GRADES.items()}
 
 # Shear yield strength as a fraction of Rp (von Mises shear yield criterion).
-BOLT_SHEAR_YLD_RATIO = 1/sqrt(3)
+SHEAR_YLD_RATIO = 1/sqrt(3)
 
 # Shear ultimate strength as a fraction of Rm (empirical, 0.6--0.65 typical).
-BOLT_SHEAR_ULT_RATIO = 0.60
+SHEAR_ULT_RATIO = 0.60
 
 
 
@@ -139,6 +140,47 @@ def al6061_BS(e_d=None):
 
 
 
+### CANTING #####################################################################
+
+def embedment_modes(p1, p2, t1, t2, M):
+    """ Lateral capacity of one stud in single shear across two members, with
+    the stud free to cant (rotate) and to form plastic hinges. This is
+    Johansen's yield model (the basis of the Eurocode 5 dowel equations, here
+    without their empirical factors or rope effect).
+
+    p1, p2 : bearing capacity per unit length (bore diameter x bearing stress)
+             of member 1 (casing) and member 2 (inner part).
+    t1, t2 : engaged lengths in member 1 and member 2.
+    M      : plastic moment of the stud.
+
+    Returns {mode: capacity}. The governing capacity is the minimum.
+
+    Modes:
+      casing uniform : member 1 crushes along its whole length, stud straight.
+      inner uniform  : member 2 crushes along its whole length, stud straight.
+      canted         : rigid stud rotates; both members crush, with reversed
+                       bearing at the far end of each. Closed form of the
+                       rigid-plastic cant model; = 0.41*p*t at t1 = t2.
+      hinge in inner : casing side rotates rigidly, stud hinges in member 2.
+      hinge in casing: inner side rotates rigidly, stud hinges in member 1.
+      two hinges     : stud hinges in both members (long, slender stud).
+    """
+    b = p2 / p1                 # embedment strength ratio.
+    r = t2 / t1                 # length ratio.
+    return {
+        "casing uniform": p1*t1,
+        "inner uniform": p2*t2,
+        "canted": p1*t1/(1 + b) * (sqrt(b + 2*b*b*(1 + r + r*r) + b**3*r*r)
+                                   - b*(1 + r)),
+        "hinge in inner": p1*t1/(2 + b) * (sqrt(2*b*(1 + b)
+                                   + 4*b*(2 + b)*M/(p1*t1*t1)) - b),
+        "hinge in casing": p1*t2/(1 + 2*b) * (sqrt(2*b*b*(1 + b)
+                                   + 4*b*(1 + 2*b)*M/(p1*t2*t2)) - b),
+        "two hinges": sqrt(2*b/(1 + b)) * sqrt(2*M*p1),
+    }
+
+
+
 ### CASES #######################################################################
 
 class Material(System):
@@ -166,6 +208,40 @@ class Shear(Material):
     Us: u.MPa # shear ultimate strength.
 
 
+class Embedment(System):
+    """ Combined casing + inner bearing, with the stud free to cant and bend
+    (see `embedment_modes`). Supersedes the two uniform bearing checks, which
+    assume the stud stays square. """
+    load: Load
+    casing: Bearing
+    inner: Bearing
+    d: u.mm   # stud diameter for bending (thread root).
+    Ys: u.MPa # stud tensile yield (for the yield-level plastic moment).
+    Us: u.MPa # stud tensile ultimate (for the ultimate-level plastic moment).
+
+    MY = calc(u.Nm, lambda s: s.Ys * s.d**3/6) # plastic moment, yield
+    MU = calc(u.Nm, lambda s: s.Us * s.d**3/6) # plastic moment, ultimate.
+
+    def _modes(s, which):
+        Y = which == "Y"
+        p1 = s.casing.D * (s.casing.Ys if Y else s.casing.Us)
+        p2 = s.inner.D * (s.inner.Ys if Y else s.inner.Us)
+        return embedment_modes(p1, p2, s.casing.L, s.inner.L,
+                               s.MY if Y else s.MU)
+
+    capY = calc(u.kN, lambda s: min(s._modes("Y").values())) # per stud.
+    capU = calc(u.kN, lambda s: min(s._modes("U").values())) # per stud.
+    modeY = calc(None, lambda s: min((m := s._modes("Y")), key=m.get))
+    modeU = calc(None, lambda s: min((m := s._modes("U")), key=m.get))
+
+    # Capacity relative to the uniform casing bearing check (1 = no effect).
+    cant_factor = calc(u.none,
+        lambda s: s.capU / (s.casing.A*s.casing.Us))
+
+    sfY = calc(u.none, lambda s: s.capY*s.load.sharing_factor / s.load.F)
+    sfU = calc(u.none, lambda s: s.capU / s.load.F)
+
+
 
 
 ### PIN #########################################################################
@@ -175,8 +251,10 @@ class Pin(System):
 
     load: Load # load.
 
-    Ys: u.MPa # shear yield strength.
-    Us: u.MPa # shear ultimate strength.
+    SYs: u.MPa # shear yield strength.
+    SUs: u.MPa # shear ultimate strength.
+    TYs: u.MPa # tensile yield strength (stud bending).
+    TUs: u.MPa # tensile ultimate strength (stud bending).
 
     D: u.mm # diameter.
     L: u.mm # length.
@@ -191,41 +269,35 @@ class Pin(System):
 
     # 1. pin shear.
     pin_shear = calc(Shear,
-        lambda s: Shear(load=s.load, A=s.A, Ys=s.Ys, Us=s.Us))
+        lambda s: Shear(load=s.load, A=s.A, Ys=s.SYs, Us=s.SUs))
     # 2&3. bearing.
     casing_bearing = calc(Bearing,
         lambda s: Bearing(load=s.load, D=s.BD, L=s.ell, edge=s.edge))
     inner_bearing = calc(Bearing,
         lambda s: Bearing(load=s.load, D=s.BD, L=s.L - s.ell))
 
+    # 4. bearing with canting and stud bending (covers 2&3 as special cases).
+    embedment = calc(Embedment,
+        lambda s: Embedment(load=s.load, casing=s.casing_bearing,
+                            inner=s.inner_bearing, d=s.D, Ys=s.TYs, Us=s.TUs))
+
     min_sfY = calc(u.none,
         lambda s: min(s.pin_shear.sfY, s.casing_bearing.sfY,
-                      s.inner_bearing.sfY))
+                      s.inner_bearing.sfY, s.embedment.sfY))
     min_sfU = calc(u.none,
         lambda s: min(s.pin_shear.sfU, s.casing_bearing.sfU,
-                      s.inner_bearing.sfU))
+                      s.inner_bearing.sfU, s.embedment.sfU))
 
 
-def pins(name, load, code, *, ell, L, edge=None, quiet=False):
-    """ Model each of `load.count` bolts as a shear pin, print the report, and
-    return the Pin.
-
-    code  : size and grade, e.g. "M5c 12.9".
-    ell   : casing engaged thread length (shear plane location).
-    L     : total engaged thread length (casing + inner).
-    edge  : casing hole-centre-to-edge distance in the load direction.
-
-    Shear is taken across the external thread minor diameter (D3). Both
-    bearing modes use the tapping drill diameter.
-    """
+def tapped_thru(load, code, *, ell_casing, ell_inner, edge=None, quiet=False):
     size, grade = code.split(" ")
     D, P, BD = BOLT_SIZES[size]
     Rp, Rm = BOLT_GRADES[grade]
     pin = Pin(load=load,
-              Ys=BOLT_SHEAR_YLD_RATIO*Rp,
-              Us=BOLT_SHEAR_ULT_RATIO*Rm,
+              SYs=SHEAR_YLD_RATIO*Rp, SUs=SHEAR_ULT_RATIO*Rm,
+              TYs=Rp, TUs=Rm,
               D=D - 1.226869*P,
-              L=L, ell=ell, BD=BD, edge=edge)
+              L=ell_casing + ell_inner, ell=ell_casing, BD=BD, edge=edge)
     if quiet:
         return pin
 
@@ -234,10 +306,11 @@ def pins(name, load, code, *, ell, L, edge=None, quiet=False):
         "bolt shear": "pin_shear",
         "casing bearing": "casing_bearing",
         "inner bearing": "inner_bearing",
+        "canted bearing": "embedment",
     }
     bar = lambda x: f"{x*load.P/1e5:.1f} bar" # pressure at a safety factor.
 
-    print(f"{name}:")
+    print(f"{load.end}:")
     print(f"  {load.count}x {size} ({grade}) bolt  "
           f"(casing {pp('casing_bearing.L')}, "
           f"inner {pp('inner_bearing.L')} engaged)")
@@ -251,35 +324,83 @@ def pins(name, load, code, *, ell, L, edge=None, quiet=False):
               f"{su:<6.2f}  {bar(su):<9}")
     gy = min(modes, key=lambda m: pin.fetch(f"{modes[m]}.sfY"))
     gu = min(modes, key=lambda m: pin.fetch(f"{modes[m]}.sfU"))
+    print(f"  canted bearing: yield by {pin.embedment.modeY}, "
+          f"ult by {pin.embedment.modeU} "
+          f"(x{pin.embedment.cant_factor:.2f} of uniform casing bearing)")
     print(f"  reuse P:  {bar(pin.min_sfY)} ({gy})")
     print(f"  burst P:  {bar(pin.min_sfU)} ({gu})")
     print()
-    pin.report()
+    # pin.report()
+    return pin
+
+
+
+def pinned(load, code, *, ell_casing, ell_inner, edge=None, quiet=False):
+    size, grade = code.split(" ")
+    assert size[0] == "D", "invalid size"
+    D = float(size[1:])*1e-3
+    if grade == "4140HT":
+        Rp = 750e6
+        Rm = 930e6
+    elif grade == "100Cr6":
+        Rp = 1700e6
+        Rm = 2200e6
+    else:
+        assert False, "invalid grade"
+    pin = Pin(load=load,
+              SYs=SHEAR_YLD_RATIO*Rp, SUs=SHEAR_ULT_RATIO*Rm,
+              TYs=Rp, TUs=Rm,
+              D=D, L=ell_casing + ell_inner, ell=ell_casing, BD=D, edge=edge)
+    if quiet:
+        return pin
+
+    pp = pin.display # pretty print.
+    modes = {
+        "bolt shear": "pin_shear",
+        "casing bearing": "casing_bearing",
+        "inner bearing": "inner_bearing",
+        "canted bearing": "embedment",
+    }
+    bar = lambda x: f"{x*load.P/1e5:.1f} bar" # pressure at a safety factor.
+
+    print(f"{load.end}:")
+    print(f"  {load.count}x {size} ({grade}) pin  "
+          f"(casing {pp('casing_bearing.L')}, "
+          f"inner {pp('inner_bearing.L')} engaged)")
+    print(f"  P = {pp('load.P')}, F = {pp('load.F_total')} "
+          f"({pp('load.F')}/pin)")
+    print(f"  {'Mode':<15}  {'SF yld':<6}  {'P yld':<9}  {'SF ult':<6}  "
+          f"{'P ult':<9}")
+    for mode, key in modes.items():
+        sy, su = pin.fetch(f"{key}.sfY"), pin.fetch(f"{key}.sfU")
+        print(f"  {mode:<15}  {sy:<6.2f}  {bar(sy):<9}  "
+              f"{su:<6.2f}  {bar(su):<9}")
+    gy = min(modes, key=lambda m: pin.fetch(f"{modes[m]}.sfY"))
+    gu = min(modes, key=lambda m: pin.fetch(f"{modes[m]}.sfU"))
+    print(f"  canted bearing: yield by {pin.embedment.modeY}, "
+          f"ult by {pin.embedment.modeU} "
+          f"(x{pin.embedment.cant_factor:.2f} of uniform casing bearing)")
+    print(f"  reuse P:  {bar(pin.min_sfY)} ({gy})")
+    print(f"  burst P:  {bar(pin.min_sfU)} ({gu})")
+    print()
     return pin
 
 
 def main():
-    # Chamber, all SI.
-    P = 30e5            # chamber pressure.
-    D_seal = 103e-3     # seal diameter.
-    D_throat = 36e-3    # throat diameter.
-    Cf = 1.4            # thrust coefficient.
+    P = 30e5               # chamber pressure.
+    D_seal = 103e-3        # seal diameter.
+    D_throat = 36e-3       # throat diameter.
+    Cf = 1.4               # thrust coefficient.
+    sharing_factor = 0.85  # -15% strength.
 
-    # Hole geometry (fresh, non-countersunk holes).
-    th_wall = 7e-3      # casing wall thickness.
-    inner_th = 9e-3     # inner part (nozzle/injector) radial thickness.
-    break_edge = 0.5e-3 # casing ID edge break after tapping.
-    edge = 13e-3        # casing axial edge distance.
+    inj = lambda n: injector(n, P, D_seal, sharing_factor)
+    noz = lambda n: nozzle(n, P, D_seal, sharing_factor, D_throat, Cf)
 
-    casing_ell = th_wall - break_edge
-    inner_ell = inner_th - 1e-3 # estimate.
-    geom = dict(ell=casing_ell, L=casing_ell + inner_ell, edge=edge)
+    inj_geom = dict(ell_casing=3.393e-3, ell_inner=9e-3, edge=15.0)
+    noz_geom = dict(ell_casing=3.631e-3, ell_inner=8.5e-3, edge=13.5)
 
-    noz = lambda n: nozzle(n, P, D_seal, D_throat, Cf)
-    inj = lambda n: injector(n, P, D_seal)
-
-    pins("nozzle", noz(8), "M5c 12.9", **geom)
-    pins("injector", inj(12), "M5c 12.9", **geom)
+    pinned(inj(12), "D8 100Cr6", **inj_geom)
+    pinned(noz(8), "D6 100Cr6", **noz_geom)
 
 
 if __name__ == "__main__":
