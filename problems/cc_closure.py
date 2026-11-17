@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utility"))
 import search
 import units as u
 from system import *
+from oring import *
 
 
 
@@ -396,11 +397,19 @@ def main():
     inj = lambda n: injector(n, P, D_seal, sharing_factor)
     noz = lambda n: nozzle(n, P, D_seal, sharing_factor, D_throat, Cf)
 
-    inj_geom = dict(ell_casing=3.393e-3, ell_inner=9e-3, edge=15.0)
-    noz_geom = dict(ell_casing=3.631e-3, ell_inner=8.5e-3, edge=13.5)
+    inj_geom = dict(ell_casing=3.23e-3, ell_inner=8.5e-3, edge=15.0)
+    noz_geom = dict(ell_casing=3.01e-3, ell_inner=8.0e-3, edge=13.5)
 
     pinned(inj(12), "D8 100Cr6", **inj_geom)
     pinned(noz(8), "D6 100Cr6", **noz_geom)
+
+
+    seal = PistonSeal(name="cc seals",
+            oring_ID=94.84e-3, oring_CS=3.53e-3,
+            gland_ID=97.2e-3, gland_OD=103.0e-3, gland_Lz=4.7e-3,
+            DP=30e5,
+            material="FKM", hardness=75, lubricated=False)
+    seal.outline(succinct=True)
 
 
 if __name__ == "__main__":

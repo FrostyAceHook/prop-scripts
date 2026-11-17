@@ -135,6 +135,10 @@ psi = Annotated[_Float, Unit("psi", 6894.757293168)]
 barg = Annotated[_Float, Unit("barg", 1e5, _ATM)]
 psig = Annotated[_Float, Unit("psig", 6894.757293168, _ATM)]
 
+# Moment.
+Nm = Annotated[_Float, Unit("Nm")]
+Nmm = Annotated[_Float, Unit("Nmm", 1e-3)]
+
 # Stiffness.
 N_m = Annotated[_Float, Unit("N/m")]
 N_mm = Annotated[_Float, Unit("N/mm", 1e3)]
