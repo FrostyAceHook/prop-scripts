@@ -9,7 +9,8 @@ from typing import NamedTuple
 import numpy as np
 import matplotlib.pyplot as plt
 
-from fmt import fmt_num, fmt_mm, fmt_ms, fmt_m_s, style_ax
+import spec as u
+from spec import show, style_ax
 
 
 __all__ = (
@@ -79,22 +80,22 @@ class Journey:
 
     def summary(self):
         lines = [f"{self.title}:"]
-        lines.append(f"  starts at {fmt_mm(self.x[0])} "
-                f"({fmt_mm(self.x_min)} & {fmt_mm(self.x_max)} stops)")
+        lines.append(f"  starts at {show(self.x[0], u.mm)} "
+                f"({show(self.x_min, u.mm)} & {show(self.x_max, u.mm)} stops)")
         if self.t_start is None:
             lines.append("  never moved within the simulated time")
             return "\n".join(lines)
-        lines.append(f"  starts moving after {fmt_ms(self.t_start)}")
+        lines.append(f"  starts moving after {show(self.t_start, u.ms)}")
         if not self.impacts:
             lines.append("  did not reach a stop "
-                    f"(ended at {fmt_mm(self.x[-1])})")
+                    f"(ended at {show(self.x[-1], u.mm)})")
             return "\n".join(lines)
         imp = self.first_impact
         lines += [
-            f"  hits {imp.stop} stop after {fmt_ms(imp.t)}",
-            f"  stroke time   : {fmt_ms(self.stroke_time)}",
-            f"  impact speed  : {fmt_m_s(abs(imp.v))}",
-            f"  impact energy : {fmt_num(imp.E)} J",
+            f"  hits {imp.stop} stop after {show(imp.t, u.ms)}",
+            f"  stroke time   : {show(self.stroke_time, u.ms)}",
+            f"  impact speed  : {show(abs(imp.v), u.m_s)}",
+            f"  impact energy : {show(imp.E, u.J)}",
         ]
         if len(self.impacts) > 1:
             lines.append(f"  ... with {len(self.impacts) - 1} further impact(s) "

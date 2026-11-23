@@ -1,42 +1,76 @@
 """
-Standard O-ring sizes.
+Standard O-ring sizes, as `OringSize` systems whose ID and CS carry the
+catalogue tolerances as Tol spreads (+-3 sigma).
 
 BS1806: British Standard imperial sizes 001-475 (the same dash numbers and
-dimensions as AS568). Nominal ID and CS with +/- tolerances, stored in metres.
-Source: BS1806 / AS568A table as published by Sealing Australia
-(sealingaustralia.com.au/oring-sizing), inch columns, converted at 25.4 mm/in.
-BS1806 itself is superseded by BS ISO 3601-1, which keeps these sizes.
+dimensions as AS568). Source: BS1806 / AS568A table as published by Sealing
+Australia (sealingaustralia.com.au/oring-sizing), inch columns. BS1806 itself
+is superseded by BS ISO 3601-1, which keeps these sizes.
 
 FINER_BS, FINER_METRIC: the Viton 75 ranges of Finer Power Transmissions
 ("Seagull" brand, sold by Industrial Shed, AIMS and others). Sources: Finer
 catalogue 4.1.43-49 "BS Series Viton O-Rings" (finerpt.com) and Finer catalogue
 pp 39-43 "Metric Viton Series" (as hosted by AIMS Industrial). Metric codes are
-MOR<ID>X<CS>V.
+mor<ID>x<CS>.
 """
 
-from dataclasses import dataclass
+from math import isfinite
+
+import spec as u
+from spec import show
+from system import System, calc, computed
 
 
 __all__ = ("OringSize", "bs1806", "finer", "BS1806", "FINER_BS", "FINER_METRIC")
 
 
-INCH = 25.4e-3
+# Two sizes are the same if both ID and CS agree to this. The closest two
+# catalogue sizes differ by 0.078 mm.
+MATCH_TOL = u.mm_(0.01)
 
 
-@dataclass(frozen=True)
-class OringSize:
-    ref: str      # e.g. "BS214"
-    ID: float     # [m] nominal inside diameter
-    CS: float     # [m] nominal cross-section
-    ID_tol: float # [m] +/- on ID
-    CS_tol: float # [m] +/- on CS
+class OringSize(System):
+    """ An O-ring: nominal ID and CS, each a Tol for its tolerance. """
+    ID: u.mm
+    CS: u.mm
 
-    @property
-    def OD(self):
-        return self.ID + 2*self.CS
+    def __post_init__(self):
+        if not (isfinite(self.ID) and isfinite(self.CS)):
+            raise ValueError("O-ring ID and CS must be finite")
+        if self.ID <= 0 or self.CS <= 0:
+            raise ValueError("O-ring ID and CS must be positive")
+
+    @classmethod
+    def custom(cls, ID, CS):
+        """ A non-catalogue size [m], with typical tolerances. """
+        # Fitted to AS568 and metric catalogues (within ~15%):
+        # +-(0.13 mm + 0.6% of ID) and +-(0.05 mm + 1.5% of CS).
+        return cls(ID=u.tol(ID, 0.13e-3 + 0.006*ID),
+                   CS=u.tol(CS, 0.05e-3 + 0.015*CS))
+
+    OD = calc(u.mm, # Sets ID (keeps CS).
+        lambda s: s.ID + 2*s.CS,
+        lambda s, OD: dict(ID=OD - 2*s.CS))
+    MD = calc(u.mm, # Sets ID (keeps CS).
+        lambda s: s.ID + s.CS,
+        lambda s, MD: dict(ID=MD - s.CS))
+
+    @computed(None)
+    def ref(self):
+        """ Catalogue reference with this ID x CS, else None. """
+        for ref, size in _CATALOGUE:
+            if abs(size.ID - self.ID) <= MATCH_TOL \
+                    and abs(size.CS - self.CS) <= MATCH_TOL:
+                return ref
+        return None
 
     def __str__(self):
-        return f"{self.ref} ({self.ID*1e3:.2f} x {self.CS*1e3:.2f} mm)"
+        return (f"{self.ref or 'custom'} "
+                f"({show(float(self.ID), u.mm, nosym=True)} x "
+                f"{show(float(self.CS), u.mm)})")
+
+    def __repr__(self):
+        return f"<OringSize {self}>"
 
 
 # Cross-section [in] and its tolerance [in] for each series (first digit of
@@ -142,15 +176,16 @@ _TABLE = """
 
 def _parse(table):
     tokens = table.split()
-    sizes = []
+    sizes = {}
     for dash, ID, ID_tol in zip(tokens[0::3], tokens[1::3], tokens[2::3]):
         CS, CS_tol = _SPECIAL_CS.get(dash) or _SERIES_CS[dash[0]]
-        sizes.append(OringSize(f"BS{dash}", float(ID)*INCH, CS*INCH,
-                float(ID_tol)*INCH, CS_tol*INCH))
-    return tuple(sizes)
+        sizes[f"BS{dash}"] = OringSize(
+                ID=u.inch_(float(ID), tol=float(ID_tol)),
+                CS=u.inch_(CS, tol=CS_tol))
+    return sizes
 
-BS1806 = _parse(_TABLE)
-_BY_REF = {s.ref: s for s in BS1806}
+_BS_BY_REF = _parse(_TABLE)
+BS1806 = tuple(_BS_BY_REF.values())
 
 
 def bs1806(ref):
@@ -160,16 +195,17 @@ def bs1806(ref):
     key = str(ref).upper().replace(" ", "").removeprefix("BS").removeprefix("-")
     key = f"BS{int(key):03d}"
     try:
-        return _BY_REF[key]
+        return _BS_BY_REF[key]
     except KeyError:
         raise KeyError(f"{ref!r} is not a BS1806 size") from None
 
 
-# ---- Finer Power Transmissions (Seagull) Viton 75 ----------------------------
+# ---- Finer Power Transmissions (Seagull) --------------------------------------
 
 # BS series stocked in Viton: 001-050, 102-178, 201-284, 309-350, 425-475.
-FINER_BS = tuple(s for s in BS1806 if not
-        350 < int(s.ref[2:]) < 425)
+_FINER_BS_BY_REF = {ref: s for ref, s in _BS_BY_REF.items()
+                    if not 350 < int(ref[2:]) < 425}
+FINER_BS = tuple(_FINER_BS_BY_REF.values())
 
 # Metric: ID [mm], CS [mm], ID tolerance [mm]. CS tolerance follows from CS.
 _FINER_CS_TOL = {1: 0.07, 1.5: 0.08, 1.6: 0.08, 2: 0.08, 3: 0.09, 4: 0.10,
@@ -183,7 +219,7 @@ _FINER_METRIC = """
 8x1.5 .16 8x1 .16    8x2 .16    8x3 .16    8x4 .16    9x1.5 .17  9x1 .17
 9x2 .17    9x3 .17    9.5x2 .17  10x1.5 .17 10x1 .17   10x2 .17   10x3 .17
 10x4 .17   10.5x1 .18 10.5x3 .18 11x1.5 .18 11x1 .18   11x2 .18   11x3 .18
-11.5x1 .19  12x1 .19  12x2 .19   12x3 .19   12x4 .19   12.1x1.6 .19
+11.5x1 .19  12x1 .19  12x2 .19   12x3 .19   12x4 .19
 12.5x1.5 .19  12.5x1 .19  12.5x2 .19  12.5x3 .19  13x1.5 .19  13x1 .19
 13x2 .19   13x3 .19   13.5x1 .19  13.5x2 .19  13.5x3 .19  14x1.5 .19
 14x1 .19   14x2 .19   14x3 .19   14x4 .19   14.1x1.6 .19  14.5x1 .20
@@ -239,23 +275,29 @@ _FINER_METRIC = """
 
 def _parse_finer(table):
     tokens = table.split()
-    sizes = []
+    sizes = {}
     for size, ID_tol in zip(tokens[0::2], tokens[1::2]):
         ID, CS = size.split("x")
-        sizes.append(OringSize(f"MOR{ID}X{CS}V", float(ID)*1e-3,
-                float(CS)*1e-3, float(ID_tol)*1e-3,
-                _FINER_CS_TOL[float(CS)]*1e-3))
-    return tuple(sorted(sizes, key=lambda s: (s.CS, s.ID)))
+        sizes[f"mor{ID}x{CS}"] = OringSize(
+                ID=u.mm_(float(ID), tol=float(ID_tol)),
+                CS=u.mm_(float(CS), tol=_FINER_CS_TOL[float(CS)]))
+    return dict(sorted(sizes.items(), key=lambda kv: (kv[1].CS, kv[1].ID)))
 
-FINER_METRIC = _parse_finer(_FINER_METRIC)
-_FINER_BY_REF = {s.ref: s for s in FINER_METRIC}
-_FINER_BY_REF.update({s.ref + "V": s for s in FINER_BS})
+_FINER_METRIC_BY_REF = _parse_finer(_FINER_METRIC)
+FINER_METRIC = tuple(_FINER_METRIC_BY_REF.values())
+_FINER_BY_REF = _FINER_METRIC_BY_REF | _FINER_BS_BY_REF
 
 
 def finer(code):
-    """ Look up a Finer Viton code: "MOR28X2V", or "BS214V" (BS series). """
-    key = str(code).upper().replace(" ", "")
+    """ Look up a Finer code: "mor28x2", or "BS214" (BS series). """
+    key = str(code).casefold().replace(" ", "")
+    if key.startswith("bs"):
+        key = "BS" + key[2:]
     try:
         return _FINER_BY_REF[key]
     except KeyError:
-        raise KeyError(f"{code!r} is not in the Finer Viton catalogue") from None
+        raise KeyError(f"{code!r} is not in the Finer catalogue") from None
+
+
+# (ref, size) of every catalogue size, for `OringSize.ref`.
+_CATALOGUE = tuple(_BS_BY_REF.items()) + tuple(_FINER_METRIC_BY_REF.items())

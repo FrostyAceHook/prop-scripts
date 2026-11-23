@@ -58,6 +58,16 @@ Every name-taking method accepts a dotted path through the tree:
 
 Inputs may carry spreads (see `spec`) for `variation`, `corners`, and a robust
 `optimise`; `sweep` and `grid` explore the design.
+
+A part is an output declared as a System, with a setter that writes it back to
+the inputs, e.g. a seal auto-sized from a slot:
+
+    seal = calc(PistonSeal, lambda s: ..., lambda s, seal: dict(slot=...))
+
+`resolved()` writes every part back, so the design's choices become fixed
+inputs with their tolerances. Statistics always run on it, so they vary the
+parts as made rather than re-choosing them. Declare what a design must meet in
+`requirements()`; `verify()` checks it, and `optimise` keeps to it.
 """
 
 import ast
@@ -90,6 +100,7 @@ __all__ = (
     "corner",
     "mean",
     "sd",
+    "Requirements",
 )
 
 
@@ -157,6 +168,13 @@ class System:
         return tuple(n for n in cls.parameters() if cls._settable_here(n))
 
     @classmethod
+    def parts(cls, views=False):
+        """ Names of settable outputs declared as a System. If `views`, also
+        includes non-settables. """
+        return tuple(n for n in cls.outputs() if _system_type_of(cls, n)
+                     and (views or cls._settable_here(n)))
+
+    @classmethod
     def _settable_here(cls, name):
         if name in cls.inputs():
             return True
@@ -214,6 +232,12 @@ class System:
             where = f"can't tweak {prefix + name!r}: {type(system).__name__}"
             if head not in system.parameters():
                 raise AttributeError(f"{where} has no parameter {head!r}")
+            alias = getattr(getattr(type(system), head, None), "alias", None)
+            if alias is not None:
+                # An alias: tweak what it names instead (spreads included).
+                system = system._tweak({alias + name[len(head):]: value},
+                                       prefix)
+                continue
             if rest:
                 # Tweak the sub-system, then set it back on this one (a
                 # replace for an input, the setter for an output).
@@ -310,6 +334,7 @@ class System:
                       a log scale (for ranges spanning decades). Any settable
                       path; one with a spread keeps it, recentred.
         constraints : {metric: (lo, hi)}, either side None for unbounded.
+                      Default: `self.requirements()`; {} for none.
         method      : "global" = differential evolution, then a Nelder-Mead
                       polish. "local" = Nelder-Mead from the current system.
         tol         : the global search stops once every member is feasible
@@ -348,8 +373,9 @@ class System:
             specs[path] = (float(lo), float(hi), is_log)
 
         metric = Metric.of(metric)
-        constraints = {Metric.of(m): bounds
-                       for m, bounds in (constraints or {}).items()}
+        if constraints is None:
+            constraints = self.requirements()
+        constraints = {Metric.of(m): bounds for m, bounds in constraints.items()}
         sign = -1.0 if maximise else 1.0
         # A fresh copy, so cached outputs (e.g. simulations) aren't sent to
         # workers.
@@ -413,16 +439,63 @@ class System:
 
 
 
+    ### DESIGN ##################################################################
+
+    def resolved(self):
+        """
+        This design with its choices made: each System input resolved, then each
+        part written back through its setter (an auto-sized part becomes a fixed
+        one, with its tolerances). Nominal values are unchanged. Statistics run
+        on this, so they vary the parts as made.
+        """
+        system = self.tweak({n: r for n in self.inputs()
+                             if isinstance(v := getattr(self, n), System)
+                             and (r := v.resolved()) is not v})
+        for name in type(system).parts():
+            new = system.tweak({name: getattr(system, name)})
+            if new != system: # unchanged parts keep the instance (and cache)
+                system = new
+        return system
+
+    def requirements(self):
+        """
+        What the design must meet, as {metric: (lo, hi)} (either side None): a
+        rule on a nominal value, or a `corner` for a worst case. Includes each
+        sub-system's (System inputs and parts), under its path. Extend with
+        `super().requirements() | {...}`.
+        """
+        cls, reqs = type(self), Requirements()
+        # TODO: why not just parameters? why muddy the "part" concept with
+        # "views"
+        for name in cls.inputs() + cls.parts(views=True):
+            sub = getattr(self, name)
+            if isinstance(sub, System):
+                reqs |= {_Sub(name, m): bounds
+                         for m, bounds in sub.requirements().items()}
+        return reqs
+
+    def verify(self):
+        """ Each requirement's value, σ margin, and whether it's met. """
+        # TODO: doesnt run on resolved self?
+        reqs = self.requirements()
+        return Verification(self,
+                {m: (lo, hi, m.measure(self)) for m, (lo, hi) in reqs.items()},
+                {m: _sigma(self, m, lo, hi) for m, (lo, hi) in reqs.items()})
+
+
+
     ### SPREADS #################################################################
 
     def spreads(self):
-        """ {dotted path: Tol or Env} of every input with a spread. """
-        return {n.path: v for n in _tree(self, include_outputs=False)
+        """ {path: Tol or Env} of every input with a spread, once resolved. """
+        return {n.path: v for n in _tree(self.resolved(),
+                                         include_outputs=False)
                 if isinstance(v := getattr(n.owner, n.leaf), Spread)}
 
     def unassessed(self):
-        """ Dotted paths of float inputs with no spread yet. """
-        return tuple(n.path for n in _tree(self, include_outputs=False)
+        """ Paths of float inputs with no spread yet, once resolved. """
+        return tuple(n.path for n in _tree(self.resolved(),
+                                           include_outputs=False)
                      if isinstance(v := getattr(n.owner, n.leaf), float)
                      and not isinstance(v, Spread))
 
@@ -437,7 +510,7 @@ class System:
         share of the variance, and how non-linear `metric` is across its band.
         Also lists the unassessed inputs that `metric` responds to, by its change
         for +-`rel_step` of each (0 skips this). Envs stay at their nominal:
-        tweak them first to look elsewhere.
+        tweak them first to look elsewhere. Runs on the resolved system.
         """
         space = _Space(self, metric)
         mid = space.measure(space.base)
@@ -459,7 +532,7 @@ class System:
         tols = {p: (c, (c/sd)**2 if sd else 0.0, n)
                 for p, (c, _, n) in tols.items()}
         responds = {}
-        for path in self.unassessed() if rel_step else ():
+        for path in space.system.unassessed() if rel_step else ():
             x = float(space.base.fetch(path))
             h = rel_step * abs(x)
             d = (space.measure(space.base, {path: x + h})
@@ -467,8 +540,9 @@ class System:
                 else math.nan # zero: no relative step to take
             if d != 0:
                 responds[path] = d
-        return Variation(self, space.metric, space.measure(self), mean, sd,
-                         tols, responds, rel_step, space.evals)
+        return Variation(space.system, space.metric,
+                         space.measure(space.system), mean, sd, tols, responds,
+                         rel_step, space.evals)
 
     def corners(self, metric, worst="min", *, k=3.0, limits=False, step=1.0,
                 max_iter=20, check=0, seed=None):
@@ -481,7 +555,7 @@ class System:
         With `limits`, every Tol goes to the limit that worsens `metric` instead
         (the absolute worst case). With `check` > 0, draws that many random Tol
         samples at the worst Env corner and counts how many are worse (Monte
-        Carlo).
+        Carlo). Runs on the resolved system.
         """
         if worst not in ("min", "max"):
             raise ValueError("worst must be 'min' or 'max'")
@@ -509,10 +583,11 @@ class System:
             for zs in rng.standard_normal((check, len(space.tols))):
                 v = space.measure(corner, space.values(zs))
                 worse += not (sign*v >= sign*value) # nan counts as worse
-        return Corners(self, space.metric, worst, k, limits,
-                space.measure(self), space.measure(space.base), value,
+        return Corners(space.system, space.metric, worst, k, limits,
+                space.measure(space.system), space.measure(space.base),
+                space.measure(corner), value,
                 at, {p: (zi, changes[p]) for p, zi in zip(space.tols, z)},
-                iters, converged, check, worse, self.unassessed(),
+                iters, converged, check, worse, space.system.unassessed(),
                 space.evals)
 
 
@@ -571,6 +646,9 @@ class System:
                     text = n.owner.display(n.leaf)
                 except Exception as e: # show it, don't kill the report.
                     text = f"<{type(e).__name__}: {e}>"
+            alias = getattr(getattr(type(n.owner), n.leaf, None), "alias", None)
+            if alias is not None: # its path from the top, as listed
+                text += f"  (= {n.path[:-len(n.leaf)]}{alias})"
             rows.append((n.path, "-" if n.dependent else " ", text))
         width = min(max((len(p) for p, _, _ in rows), default=0), 36)
         lines = [type(self).__name__ + "\n"]
@@ -603,13 +681,15 @@ class System:
 ### PROPERTIES ##################################################################
 
 class output(property):
-    """ A property with a display unit. Cached per instance by default. """
+    """ A property with a display unit. Cached per instance by default. An
+    alias has `alias`: the path it names. """
 
     def __init__(self, fget=None, fset=None, fdel=None, doc=None, *,
-                 unit=None, cache=True):
+                 unit=None, cache=True, alias=None):
         super().__init__(fget, fset, fdel, doc)
         self.unit = unit
         self.cache = cache
+        self.alias = alias
         self.name = None
 
     def __set_name__(self, owner, name):
@@ -627,7 +707,8 @@ class output(property):
 
     def _copy(self, **changes):
         kw = dict(fget=self.fget, fset=self.fset, fdel=self.fdel,
-                  doc=self.__doc__, unit=self.unit, cache=self.cache) | changes
+                  doc=self.__doc__, unit=self.unit, cache=self.cache,
+                  alias=self.alias) | changes
         return type(self)(**kw)
 
     def getter(self, fget):
@@ -635,6 +716,13 @@ class output(property):
 
     def setter(self, fset):
         return self._copy(fset=fset)
+
+def alias(unit, alias, *, doc=None):
+    """ Another name for the parameter `alias`. Tweaking it tweaks `alias`,
+    spreads included. """
+    return output(lambda s: s.fetch(alias), lambda s, v: {alias: v},
+                  doc=doc or f"Alias of {alias}.", unit=unit, cache=False,
+                  alias=alias)
 
 def computed(unit):
     """ Caching and unit annotation. """
@@ -690,6 +778,12 @@ class Metric:
         if isinstance(self.source, str):
             return self.source
         return getattr(self.source, "__name__", repr(self.source))
+
+    @property
+    def path(self):
+        """ The dotted path measured: the source path, else (a function) the
+        name. """
+        return self.source if isinstance(self.source, str) else self.name
 
     def unit_on(self, system):
         """ Display Unit on `system`: the one given, else a path's own. """
@@ -780,6 +874,10 @@ class corner(Metric):
         return f"{self.of.name} ({how} {self.worst})"
 
     @property
+    def path(self):
+        return self.of.path
+
+    @property
     def delta(self):
         return self.of.delta
 
@@ -812,6 +910,10 @@ class _FromVariation(Metric):
     def name(self):
         return f"{self.of.name} ({self.stat})"
 
+    @property
+    def path(self):
+        return self.of.path
+
     def unit_on(self, system):
         return self.of.unit_on(system)
 
@@ -843,6 +945,87 @@ class sd(_FromVariation):
     delta = True
 
 
+class _WorstSigma(Metric):
+    """
+    A metric: the smallest σ margin over a system's requirements that are
+    corners (nominal ones have none: keep them as constraints), at least 0 when
+    they all pass. Filter which requirements count as `Requirements` does.
+    Maximise it for the design furthest from failing, or closest to passing:
+
+        s.optimise(worst_sigma.without("tube_seal"), params,
+                   s.requirements().nominal(), maximise=True)
+    """
+    def __init__(self, without=(), only=None):
+        self.without_paths = tuple(without)
+        self.only_paths = None if only is None else tuple(only)
+
+    @property
+    def name(self):
+        notes = ([f"only {', '.join(self.only_paths)}"]
+                 if self.only_paths is not None else []) \
+              + ([f"without {', '.join(self.without_paths)}"]
+                 if self.without_paths else [])
+        return "worst σ margin" + (f" ({'; '.join(notes)})" if notes else "")
+
+    @property
+    def path(self):
+        return "worst_sigma"
+
+    def unit_on(self, system):
+        return None
+
+    def without(self, *paths):
+        """ This, ignoring requirements at or under `paths` too. """
+        return type(self)(self.without_paths + paths, self.only_paths)
+
+    def only(self, *paths):
+        """ This, counting only requirements at or under `paths`. """
+        return type(self)(self.without_paths, paths)
+
+    def _value(self, system):
+        reqs = system.requirements()
+        if self.only_paths is not None:
+            reqs = reqs.only(*self.only_paths)
+        reqs = reqs.without(*self.without_paths)
+        sigmas = [_sigma(system, m, lo, hi) for m, (lo, hi) in reqs.items()]
+        sigmas = [-math.inf if math.isnan(b) else b
+                  for b in sigmas if b is not None]
+        return min(sigmas) if sigmas else math.nan
+
+    def _kwargs(self):
+        return dict(without=self.without_paths, only=self.only_paths)
+
+worst_sigma = _WorstSigma()
+
+
+class _Sub(Metric):
+    """ A sub-system's metric: `metric` measured on the system at `path`. """
+    def __init__(self, at, metric):
+        self.at = at
+        self.of = Metric.of(metric)
+
+    @property
+    def name(self):
+        return f"{self.at}.{self.of.name}"
+
+    @property
+    def path(self):
+        return f"{self.at}.{self.of.path}"
+
+    @property
+    def delta(self):
+        return self.of.delta
+
+    def unit_on(self, system):
+        return self.of.unit_on(system.fetch(self.at))
+
+    def _value(self, system):
+        return self.of._value(system.fetch(self.at))
+
+    def _kwargs(self):
+        return dict(at=self.at, metric=self.of)
+
+
 def _cached(system, key, compute):
     """ `compute()`, cached on the (immutable) `system`, as outputs are. """
     cache = system.__dict__.setdefault("_metric_cache", {})
@@ -869,6 +1052,116 @@ def _build(cls, kwargs):
     """ cls(**kwargs) (for unpickling). """
     return cls(**kwargs)
 
+
+
+
+### REQUIREMENTS ################################################################
+
+class Requirements(dict):
+    """
+    {Metric: (lo, hi)}, as `System.requirements` gives: a plain dict (so
+    `optimise` takes it), keyed by Metric, with filters on each metric's
+    `path` (its dotted source path, under any sub-system; a function metric's
+    leaf is its name). A path matches itself and everything below it:
+
+        reqs.without("tube_seal")               # all of one sub-system
+        reqs.without("outer_seal.ID_stretch")   # its stretch, both sides
+        reqs.only("margin_actuate")
+        reqs.nominal()                          # those without a corner
+    """
+    def __init__(self, items=()):
+        super().__init__((Metric.of(m), b) for m, b in dict(items).items())
+
+    def without(self, *paths):
+        """ Those whose path is not at or under any of `paths`. """
+        return Requirements({m: b for m, b in self.items()
+                             if not _under(m.path, paths)})
+
+    def only(self, *paths):
+        """ Those whose path is at or under one of `paths`. """
+        return Requirements({m: b for m, b in self.items()
+                             if _under(m.path, paths)})
+
+    def nominal(self):
+        """ Those checked at nominal (not a `corner`): no σ margin. """
+        return Requirements({m: b for m, b in self.items()
+                             if not isinstance(_leaf(m), corner)})
+
+    def __or__(self, other):
+        return Requirements({**self, **Requirements(other)})
+    def __ror__(self, other):
+        return Requirements({**Requirements(other), **self})
+    def __ior__(self, other):
+        self.update(Requirements(other))
+        return self
+
+
+def _under(path, prefixes):
+    return any(path == p or path.startswith(p + ".") for p in prefixes)
+
+def _leaf(m):
+    """ The metric inside any sub-system wrappers. """
+    while isinstance(m, _Sub):
+        m = m.of
+    return m
+
+def _sigma(system, m, lo, hi):
+    """
+    σ margin of requirement `m` in [lo, hi]: the sigma at which its bound is
+    reached (from the middle: Tols at their means, at the worst Env corner),
+    less the `k` it's required at. Positive passes with that to spare, negative
+    fails. Linear from the `k`-sigma worst, so exact for a linear metric. None
+    for a requirement checked at nominal.
+    """
+    while isinstance(m, _Sub):
+        try:
+            system = system.fetch(m.at)
+        except _BAD:
+            return math.nan
+        m = m.of
+    if not isinstance(m, corner) or m.limits:
+        return None
+    bound = lo if m.worst == "min" else hi
+    if bound is None:
+        return None
+    try:
+        c = m.result(system)
+    except _BAD:
+        return math.nan
+    gap, reach = c.middle - bound, c.middle - c.value
+    if reach == 0: # insensitive to every Tol
+        meets = gap >= 0 if m.worst == "min" else gap <= 0
+        return math.inf if meets else -math.inf
+    return c.k * gap / reach - c.k
+
+
+
+@dataclasses.dataclass(eq=False)
+class Verification:
+    """ Result of `System.verify`. """
+    system: System
+    results: dict = dataclasses.field(repr=False) # Metric -> (lo, hi, value)
+    sigmas: dict = dataclasses.field(repr=False) # Metric -> σ margin or None
+
+    @property
+    def failed(self):
+        """ {Metric: (lo, hi, value)} of every requirement not met. """
+        return {m: r for m, r in self.results.items() if _violation(*r) > 0}
+
+    @property
+    def ok(self):
+        return not self.failed
+
+    def summary(self):
+        verdict = "all met" if self.ok else f"{len(self.failed)} not met"
+        sigma = lambda b: "" if b is None else f"{b:+.2f}σ"
+        return (f"Requirements of {type(self.system).__name__} ({verdict}):\n"
+                + _constraint_table(self.system, self.results, "requirement",
+                    {m: sigma(b) for m, b in self.sigmas.items()}))
+    def __str__(self):
+        return self.summary()
+    def report(self):
+        print(self.summary())
 
 
 
@@ -958,27 +1251,32 @@ class Optimum:
         rows = []
         for p, v in self.params.items():
             lo, hi = self.bounds[p]
-            at = "(@bound) " if min(abs(v - lo), abs(v - hi)) \
+            at = "@bound  " if min(abs(v - lo), abs(v - hi)) \
                     < 1e-3*abs(hi - lo) else ""
             rows.append([p, p_show(p, self.start[p]), p_show(p, v),
                          f"{at}[{p_show(p, lo)}, {p_show(p, hi)}]"])
         lines.append(table(rows, ["param", "start", "optimum", "bounds"]))
         if self.constraints:
-            lines.append("")
-            rows = []
-            for m, (lo, hi, v) in self.constraints.items():
-                need = ("" if lo is None else f"{m.show(lo, s)} <= ") + "x" \
-                     + ("" if hi is None else f" <= {m.show(hi, s)}")
-                ok = "ok" if _violation(lo, hi, v) == 0.0 else "VIOLATED"
-                rows.append([m.name, m.show(v, s), need, ok])
-            lines.append(table(rows, ["constraint", "value", "required",
-                                      ""]))
+            lines += ["", _constraint_table(s, self.constraints)]
         return "\n".join(lines)
     def __str__(self):
         return self.summary()
     def report(self):
         print(self.summary())
 
+
+def _constraint_table(system, constraints, header="constraint", notes=None):
+    """ Table of {Metric: (lo, hi, value)}: value, requirement, ok, and any
+    `notes` {Metric: text} as a last column. """
+    rows = []
+    for m, (lo, hi, v) in constraints.items():
+        need = ("" if lo is None else f"{m.show(lo, system)} <= ") + "x" \
+             + ("" if hi is None else f" <= {m.show(hi, system)}")
+        ok = "ok" if _violation(lo, hi, v) == 0.0 else "VIOLATED"
+        rows.append([m.name, m.show(v, system), need, ok]
+                    + ([notes.get(m, "")] if notes else []))
+    return table(rows, [header, "value", "required", ""]
+                 + (["σ margin"] if notes else []))
 
 def _violation(lo, hi, value):
     """ Total relative violation of lo <= value <= hi (0 if satisfied). """
@@ -1013,9 +1311,11 @@ _INFEASIBLE = 1e9
 
 class _Space:
     """ The Tol inputs of a system as independent standard normals (z = 0 is
-    every Tol at its mean), and `metric` measured over them. """
+    every Tol at its mean), and `metric` measured over them. Works on the
+    resolved system (`self.system`). """
 
     def __init__(self, system, metric):
+        system = self.system = system.resolved()
         spreads = system.spreads()
         tols = {p: t for p, t in spreads.items() if isinstance(t, Tol)}
         self.base = system.tweak({p: t.mean for p, t in tols.items()})
@@ -1101,7 +1401,7 @@ class _Space:
 @dataclasses.dataclass(eq=False)
 class Variation:
     """ Result of `System.variation`. """
-    system: System
+    system: System # the resolved system analysed
     metric: Metric
     nominal: float # metric with every input at its nominal
     mean: float # to second order
@@ -1161,13 +1461,14 @@ class Variation:
 @dataclasses.dataclass(eq=False)
 class Corners:
     """ Result of `System.corners`. """
-    system: System
+    system: System # the resolved system analysed: `point`'s paths are its
     metric: Metric
     worst: str # "min" or "max"
     k: float
     limits: bool # arithmetic worst case, not statistical
     nominal: float # metric with every input at its nominal
     mean: float # metric with every Tol at its mean
+    middle: float # metric with every Tol at its mean, at the worst Env corner
     value: float # metric at the worst point
     envs: dict = dataclasses.field(repr=False) # path -> value at the corner
     tols: dict = dataclasses.field(repr=False) # path -> (z, value)
@@ -1180,8 +1481,14 @@ class Corners:
 
     @property
     def point(self):
-        """ {path: value} of every spread input at the worst point. """
+        """ {path: value} of every spread input at the worst point, as paths
+        on `system`. """
         return self.envs | {p: v for p, (_, v) in self.tols.items()}
+
+    def build(self):
+        """ The worst build: `system` tweaked to `point` (spreads kept,
+        recentred). """
+        return self.system.tweak(self.point)
 
     def summary(self):
         s, m = self.system, self.metric
@@ -1429,8 +1736,9 @@ def _declaration_order(cls):
                     isinstance(node.target, ast.Name)):
                 names.append(node.target.id)  # D_seat: u.mm
             elif isinstance(node, ast.Assign):
-                names += [t.id for t in node.targets
-                          if isinstance(t, ast.Name)]  # A_seat = ...
+                for target in node.targets:  # A_seat = ..., or a, b = ...
+                    names += [t.id for t in getattr(target, "elts", [target])
+                              if isinstance(t, ast.Name)]
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 names.append(node.name)  # @property def F_pneumo(...)
     params = cls.inputs() + cls.outputs()

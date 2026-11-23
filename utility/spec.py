@@ -129,27 +129,27 @@ class Converter:
 
 ### SPREADS #####################################################################
 
-def show(x, unit=None, fmt=None, *, delta=False, limits=False):
+def show(x, unit=None, fmt=None, *, delta=False, limits=False, nosym=False):
     """
     SI `x` as text in `unit` (a Unit or an alias like `u.mm`), with its spread if
-    it has one. `fmt` formats each number (default 4 sig. figs). With `delta`, a
+    it has one. `fmt` formats each number (default 5 sig. figs). With `delta`, a
     `x` is a difference, so unit will only be used for scaling. With `limits`, a
     spread shows only its limits. Non-numbers give their repr.
     """
     if isinstance(x, bool) or not isinstance(x, numbers.Real):
         return repr(x)
-    fmt = fmt or (lambda v: f"{v:.4g}")
+    fmt = fmt or (lambda v: f"{v:.5g}")
     unit = unit_obj_of(unit)
     if isinstance(x, Spread):
         conv = unit.from_si if unit else (lambda v: v)
-        sym = unit.display if unit else ""
+        sym = unit.display if (unit and not nosym) else ""
         if limits:
             return x._limits_text(conv, fmt) + sym
         return x._show(conv, unit.scale if unit else 1.0, sym, fmt)
     if unit is None:
         return fmt(x)
     value = x / unit.scale if delta else unit.from_si(x)
-    return f"{fmt(value)}{unit.display}"
+    return f"{fmt(value)}{'' if nosym else unit.display}"
 
 class Spread(float):
     """
