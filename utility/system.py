@@ -474,10 +474,10 @@ class System:
                          for m, bounds in sub.requirements().items()}
         return reqs
 
-    def verify(self):
+    def verify(self, reqs=None):
         """ Each requirement's value, σ margin, and whether it's met. """
-        # TODO: doesnt run on resolved self?
-        reqs = self.requirements()
+        if reqs is None:
+            reqs = self.requirements()
         return Verification(self,
                 {m: (lo, hi, m.measure(self)) for m, (lo, hi) in reqs.items()},
                 {m: _sigma(self, m, lo, hi) for m, (lo, hi) in reqs.items()})
