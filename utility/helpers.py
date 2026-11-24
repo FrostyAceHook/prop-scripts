@@ -2,7 +2,7 @@ import math
 from math import sqrt, pi
 
 import spec as u
-from spec import show, style_ax
+from spec import show, style_ax, table
 from system import *
 
 
@@ -11,6 +11,8 @@ __all__ = (
     "SPRING_WIRE",
     "friction",
     "least_margin",
+    "reseal",
+    "seal_options",
     "Circle",
     "Balance",
     "Spring",
@@ -37,6 +39,65 @@ def least_margin(s):
     its margin beyond what's required, at the requirement's worst case. """
     reqs = s.requirements().only(*s.balances)
     return min(m.measure(s) - lo for m, (lo, _) in reqs.items())
+
+
+def reseal(s, name, round_root=u.mm_(0.01), round_Lz=u.mm_(0.05), **auto):
+    """
+    s with seal `name` (slot gr_<name>, seal or_<name>) re-sized as
+    AutoGroove(**auto) would (e.g. CS=u.mm_(1.5), squeeze=0.16), then frozen
+    as a Groove: its root rounded to `round_root` toward more squeeze, its
+    width to `round_Lz` (None leaves either as sized). The slot's material,
+    hardness, lubrication and friction level carry over.
+    """
+    from oring import AutoGroove, Groove
+    slot = getattr(s, "gr_" + name)
+    keep = dict(material=slot.material, hardness=slot.hardness,
+                lubricated=slot.lubricated, friction_level=slot.friction_level)
+    s = s.tweak({"gr_" + name: AutoGroove(**keep | auto)})
+    seal = getattr(s, "or_" + name)
+    groove = Groove.of(seal)
+    if round_root:
+        x = groove.root / round_root
+        x = math.ceil(x - 1e-6) if seal.kind == "piston" \
+            else math.floor(x + 1e-6)
+        groove = groove.tweak(root=x * round_root)
+    if round_Lz:
+        groove = groove.tweak(Lz=round(groove.Lz / round_Lz) * round_Lz)
+    return s.tweak({"gr_" + name: groove})
+
+
+def seal_options(s, name, CS=(None,), squeeze=(0.15,), gland_fill=(0.7,),
+                 **kw):
+    """ A table of seal `name` re-sealed (see `reseal`) at every combination
+    of CS, squeeze and gland fill: its ring, groove, 3σ ranges, friction, and
+    which of its own requirements fail. Returns the passing systems. """
+    rows, passing = [], []
+    for cs in CS:
+        for sq in squeeze:
+            for fill in gland_fill:
+                label = [show(cs, u.mm) if cs else "auto", f"{sq:.0%}",
+                         f"{fill:.0%}"]
+                try:
+                    r = reseal(s, name, CS=cs, squeeze=sq, gland_fill=fill,
+                               **kw)
+                except ValueError:
+                    rows.append(label + ["no ring fits"] + [""]*6)
+                    continue
+                seal = getattr(r, "or_" + name)
+                ver = seal.verify()
+                rng = lambda n: "{:.1%}..{:.1%}".format(*seal.bounds(n))
+                rows.append(label + [
+                    seal.oring.ref or "custom",
+                    seal.display("gland_root"), seal.display("gland_Lz"),
+                    rng("squeeze"), rng(seal.fit),
+                    show(seal.F_friction_breakaway, u.N),
+                    "ok" if ver.ok else ", ".join(m.name for m in ver.failed)])
+                if ver.ok:
+                    passing.append(r)
+    print(f"Options for {name}:\n" + table(rows, ["CS", "squeeze", "fill",
+            "ring", "root", "Lz", "squeeze (3σ)", "fit (3σ)", "breakaway",
+            ""]))
+    return passing
 
 
 class Circle(System):
