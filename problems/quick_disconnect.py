@@ -12,36 +12,12 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "utility"))
 
-import search
-import units as u
-from fmt import style_ax
+import spec as u
+from spec import show
 from oring import *
 from system import *
 from travel import *
-
-
-SQRT2 = sqrt(2)
-
-def circ_area(D):
-    return pi/4 * D*D
-def circ_area_to_D(A):
-    return sqrt(A*4/pi)
-def circ_perim(D):
-    return pi*D
-def circ_perim_to_D(p):
-    return p/pi
-
-def calc_circ_D(name):
-    return derived(u.mm, name, circ_area_to_D, circ_area)
-def calc_circ_A(name):
-    return derived(u.mm2, name, circ_area, circ_area_to_D)
-
-def _value(x, default):
-    """ `x`, or `default` if it's None. """
-    return default if x is None else x
-def _nanmax(*xs):
-    """ max(), but nan if any value is nan. """
-    return nan if any(isnan(x) for x in xs) else max(xs)
+from helpers import *
 
 
 
@@ -53,95 +29,81 @@ class QuickDisconnect(System):
     sim_dt: u.ms # Simulation time step.
     sim_t_end: u.ms # Simulation max sim time.
 
-    # --- tube ---
-    D_tube: u.mm
-    A_tube = calc_circ_A("D_tube")
+    # --- geometry ---
+    tube: Circle
+    piston: Circle
 
     # --- pneumo ---
     P_pneumo: u.bar
-    D_pneumo: u.mm
     A_pneumo = calc(u.mm2,
-        lambda s: circ_area(s.D_pneumo) - s.A_tube,
-        lambda s, A: dict(D_pneumo=circ_area_to_D(A + s.A_tube)))
+        lambda s: s.piston.A - s.tube.A,
+        lambda s, A: {"piston.A": A + s.tube.A})
     F_pneumo = calc(u.N,
-        lambda s: s.P_pneumo*s.A_pneumo,
-        lambda s, F: dict(A_pneumo=F/s.P_pneumo))
+        lambda s: (s.P_pneumo - u.bar_(1))*s.A_pneumo,
+        lambda s, F: dict(A_pneumo=F/(s.P_pneumo - u.bar_(1))))
 
-    # --- friction ---
-    orings: tuple = None # O-rings: (tube, piston inner, piston outer)
-    @computed(None)
-    def all_seals(self):
-        if self.orings is not None:
-            return self.orings
-        return (
-            RodSeal.auto("Tube", self.D_tube,
-                    squeeze=0.15, gland_fill=0.7,
-                    DP=self.P_pneumo, CS=1.5e-3,
-                    material="FKM", hardness=75, lubricated=True),
-            RodSeal.auto("Piston inner", self.D_tube,
-                    squeeze=0.125, gland_fill=0.7,
-                    DP=self.P_pneumo, CS=1.5e-3,
-                    material="FKM", hardness=75, lubricated=True),
-            PistonSeal.auto("Piston outer", self.D_pneumo,
-                    squeeze=0.15, gland_fill=0.7,
-                    DP=self.P_pneumo, CS=1.5e-3,
-                    material="FKM", hardness=75, lubricated=True),
-        )
-    dynamic_seals = computed(None)(lambda s: s.all_seals[1:])
+    # --- seals ---
+    # Each slot is a Groove (sized by hand) or an AutoGroove (sized for its
+    # diameter whenever that changes, e.g. while optimising D_pneumo), with its
+    # own friction scatter. The seals add D_tube or D_pneumo, P_pneumo and the
+    # shared compound.
+    gr_tube: Groove | AutoGroove
+    gr_inner: Groove | AutoGroove
+    gr_outer: Groove | AutoGroove
 
+    def _seal(self, slot, kind, name, D, sliding=True):
+        return slot.seal(kind, name, D, DP=self.P_pneumo, sliding=sliding)
+    or_tube = calc(RodSeal, # Tube in the body (static).
+        lambda s: s._seal(s.gr_tube, RodSeal, "Tube", s.tube.D, sliding=False),
+        lambda s, seal: dict(gr_tube=Groove.of(seal)))
+    or_inner = calc(RodSeal, # Piston, sliding on the tube.
+        lambda s: s._seal(s.gr_inner, RodSeal, "Piston inner", s.tube.D),
+        lambda s, seal: dict(gr_inner=Groove.of(seal)))
+    or_outer = calc(PistonSeal, # Piston, sliding in the bore.
+        lambda s: s._seal(s.gr_outer, PistonSeal, "Piston outer",
+                s.piston.D),
+        lambda s, seal: dict(gr_outer=Groove.of(seal)))
+
+    def seals(self):
+        return (self.or_tube, self.or_inner, self.or_outer)
+
+    # --- friction (the tube seal is static) ---
     F_fric_running = calc(u.N, # Net sliding friction.
-        lambda s: sum(o.F_friction_running for o in s.dynamic_seals))
+        lambda s: s.or_inner.F_friction_running
+                + s.or_outer.F_friction_running)
     F_fric_breakaway = calc(u.N, # Net static friction.
-        lambda s: sum(o.F_friction_breakaway for o in s.dynamic_seals))
+        lambda s: s.or_inner.F_friction_breakaway
+                + s.or_outer.F_friction_breakaway)
 
 
     # --- force balances (+ve margin = works) ---
-    @staticmethod
-    def excess(drive, oppose):
-        """ Fractional excess of drive over oppose (safety factor - 1). """
-        return drive / oppose - 1 if oppose > 0 else float("inf")
-
-    margin_actuate = calc(u.N,
-        lambda s: s.F_pneumo - max(s.F_fric_breakaway, s.F_fric_running)
-    )
-    rmargin_actuate = calc(u.percent,
-        lambda s: s.excess(s.F_pneumo, max(s.F_fric_breakaway, s.F_fric_running))
-    )
+    actuate = calc(Balance, lambda s: Balance.of(
+        (s.F_pneumo, s.F_fric_breakaway),
+        (s.F_pneumo, s.F_fric_running)))
 
 
-    # --- tolerances ---
-    def tolerances(self):
-        return {
-            "P_pneumo": 0.1,
-            "orings": (
-                tuple(o.loose for o in self.all_seals),
-                tuple(o.tight for o in self.all_seals),
-            )
+    # --- requirements ---
+    # Actuates at the worst supply pressure and the 3σ worst build. The seals'
+    # own requirements come along under their paths.
+    def requirements(self):
+        return super().requirements() | {
+            corner("actuate.margin"): (0.0, None),
         }
-    worst_margin_actuate = calc(u.N,
-        lambda s: search.corners(s, "margin_actuate", s.tolerances()).value)
-    worst_rmargin_actuate = calc(u.percent,
-        lambda s: search.corners(s, "rmargin_actuate", s.tolerances()).value)
 
-
-    # --- optimisation ---
-    cost = calc(None, lambda s: (s.P_pneumo/1e5)**2
-                              + (s.D_pneumo/5e-3)**2
-                            )
 
 
     # --- dynamics ---
 
     crack_time = calc(u.ms,
-        lambda s: _value(s._actuating.t_start, inf))
+        lambda s: ifnan(s._actuating.t_start, inf))
     stroke_time = calc(u.ms,
-        lambda s: _value(s._actuating.stroke_time, inf))
+        lambda s: ifnan(s._actuating.stroke_time, inf))
     t_actuate = calc(u.ms,
-        lambda s: _value(s._actuating.t_impact, inf))
+        lambda s: ifnan(s._actuating.t_impact, inf))
     v_impact_actuate = calc(u.m_s,
-        lambda s: abs(_value(s._actuating.v_impact, nan)))
+        lambda s: abs(ifnan(s._actuating.v_impact, nan)))
     E_impact_actuate = calc(u.J,
-        lambda s: _value(s._actuating.E_impact, nan))
+        lambda s: ifnan(s._actuating.E_impact, nan))
 
     def _forces(s):
         def pneumo(t, x, v):
@@ -175,20 +137,100 @@ class QuickDisconnect(System):
         return self._actuating.plot()
 
 
+def opts_oring():
+    return dict(material="NBR", hardness=u.shoreA_(70, tol=5), lubricated=True)
+
+def build():
+    """ The design as drawn: every seal hand-sized. """
+    mm, ms, bar = u.mm_, u.ms_, u.bar_
+    return QuickDisconnect(
+        m=0.00339039, stroke=mm(3.4),
+        tau_fill=ms(5),
+        sim_dt=ms(0.001), sim_t_end=ms(200),
+        tube=Circle(D=mm(6, tol=(-0.1, 0.05))),
+        piston=Circle(D=mm(15.2, tol=(0, 0.05))),
+        P_pneumo=bar(10, env=(8, 10)),
+        gr_tube=Groove(oring=finer("mor6x1"),
+                root=mm(7.72, tol=0.05), Lz=mm(1.4, tol=0.1), **opts_oring()),
+        gr_inner=Groove(oring=finer("mor6x1"),
+                root=mm(7.72, tol=0.05), Lz=mm(1.4, tol=0.1), **opts_oring()),
+        gr_outer=Groove(oring=finer("mor12.5x1.5"),
+                root=mm(12.78, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
+    )
+def resizing(qd):
+    return qd.tweak(dict(
+        gr_tube =AutoGroove(squeeze=0.150, **opts_oring()),
+        gr_inner=AutoGroove(squeeze=0.125, **opts_oring()),
+        gr_outer=AutoGroove(squeeze=0.150, **opts_oring()),
+    ))
+
+
 
 def main():
-    qd = QuickDisconnect(
-        m=0.00339039, stroke=3.4e-3,
-        tau_fill=5e-3,
-        sim_dt=0.001e-3, sim_t_end=200e-3,
-        D_tube=6e-3,
-        P_pneumo=10e5, D_pneumo=15.2e-3,
-    )
-
+    qd = build()
     qd.report()
-    for oring in qd.all_seals:
-        oring.outline(succinct=True)
-    qd.plot()
+    for seal in qd.seals():
+        seal.outline(succinct=True)
+    qd.verify().report()
+
+
+
+def tolerances(qd):
+    """ What drives the actuation margin, and its worst build. """
+    qd.variation("actuate.margin").report()
+    worst = qd.corners("actuate.margin", check=20000, seed=1)
+    worst.report()
+    build = worst.build()
+    print("worst build:", build.display("actuate.margin"),
+          build.display("F_fric_breakaway"), build.display("P_pneumo"))
+    qd.corners("actuate.margin", limits=True).report() # arithmetic worst
+
+
+def sweeps(qd):
+    """ Margin against supply pressure (as built), and against bore (as
+    designed: the outer seal re-sized for each bore). """
+    k3 = corner("actuate.margin")
+    # A shifting envelope, so the sweep can move the supply past 8-10 bar.
+    shifting = qd.tweak(P_pneumo=u.bar_(10, env=(-2, 0), abs=True))
+    P = [u.bar_(p) for p in (4, 5, 6, 7, 8, 9, 10, 11, 12)]
+    sweep = shifting.sweep("P_pneumo", P, "actuate.margin", k3,
+                           "F_fric_breakaway")
+    sweep.report()
+    sweep.plot()
+
+    design = resizing(qd)
+    D = u.mm_(np.linspace(12, 30, 100))
+    sweep = design.sweep("piston.D", D, "actuate.margin", k3,
+                         "or_outer.F_friction_breakaway")
+    sweep.report()
+    sweep.plot()
+
+
+def grid(qd):
+    """ Where the 3σ actuation margin runs out, over supply and bore. """
+    design = resizing(qd).tweak(P_pneumo=u.bar_(10, env=(-2, 0), abs=True))
+    P = u.bar_(np.linspace(3, 10, 10))
+    D = u.mm_(np.linspace(10, 30, 50))
+    g = design.grid("piston.D", D, "P_pneumo", P, corner("actuate.margin"))
+    g.plot()
+    return g
+
+
+def optimise(qd):
+    """ The smallest bore that actuates at 3σ with the outer seal's
+    requirements met, then the most robust bore at 10 bar. """
+    design = resizing(qd)
+    reqs = design.requirements().without("or_tube", "or_inner")
+    best = design.optimise("piston.D", {"piston.D": (u.mm_(10), u.mm_(20))},
+                           reqs, seed=1, popsize=8, maxiter=20, verbose=False)
+    best.report()
+    robust = design.optimise(
+            worst_sigma.without("or_tube", "or_inner"),
+            {"piston.D": (u.mm_(10), u.mm_(20))}, reqs.nominal(),
+            maximise=True, seed=1, popsize=8, maxiter=20, verbose=False)
+    robust.report()
+    robust.system.verify().report()
+    return best, robust
 
 
 if __name__ == "__main__":
