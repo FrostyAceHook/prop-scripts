@@ -73,13 +73,29 @@ class Unit:
     def to_si(self, value: float, *,
               tol: float | tuple[float, float] | None = None,
               env: float | tuple[float, float] | None = None,
+              iso286: str | None = None, centred: bool = False,
               **options) -> float:
         """
         Display value (in this unit) -> SI value. `tol` and `env` allow spread
-        creation also: see `Tol.create` and `Env.create`.
+        creation also: see `Tol.create` and `Env.create`. A length can instead
+        take an ISO 286 class (`iso286="H7"`) as its tol, where `centred` puts
+        the value mid-band, with a symmetric tol.
         """
-        if tol is not None and env is not None:
-            raise ValueError("give tol or env, not both")
+        if sum(x is not None for x in (tol, env, iso286)) > 1:
+            raise ValueError("give at most one of tol, env or iso286")
+        if centred and iso286 is None:
+            raise TypeError("centred only applies with iso286")
+        if iso286 is not None:
+            from iso286 import deviations # (it imports this module)
+            if self.offset:
+                raise TypeError(f"iso286 needs a length unit, not {self.symbol}")
+            lo, hi = (round(x/self.scale, 12) for x in
+                      deviations(iso286, value*self.scale))
+            if centred:
+                value = round(value + (lo + hi)/2, 12)
+                tol = round((hi - lo)/2, 12)
+            else:
+                tol = (lo, hi)
         if tol is not None:
             return Tol.create(value, tol, unit=self, **options)
         if env is not None:

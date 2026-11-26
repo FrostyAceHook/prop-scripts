@@ -50,6 +50,9 @@ THRUST = (1 + GAMMA)*CHOKE
 # seat (brass).
 BALL = (200e9, 0.29)
 SEAT = (100e9, 0.34)
+BODY = (69e9, 0.33) # 6061-T6.
+BRASS_YIELD = 310e6 # C36000 half-hard.
+MU_PRESS = 0.25 # Brass pressed into aluminium, dry (~0.2-0.35).
 
 
 
@@ -62,12 +65,20 @@ class VentValve(System):
 
     # --- geometry ---
     ball: Circle
-    seat_bore: Circle # Under the seat, from the tank: the flow's choke.
+    choke: Circle # Under the seat, from the tank: the flow's choke.
     outlet: Circle # Each outlet line, from the cavity to atmosphere.
     outlets: int # How many.
     shaft: Circle # Pushes the ball; through the shaft seal.
     piston: Circle # Pneumatic piston bore.
     spring: Spring # Opening, around the shaft; long when open.
+
+    # --- seat insert: brass, pressed into the body from above ---
+    insert: Circle # Its press-fit diameter.
+    pocket: Circle # The body's bore it's pressed into.
+    insert_L: u.mm # Press-fit length.
+    land_ID: Circle # The annulus under it that seals on the pocket floor:
+    land_OD: Circle # inside it the bore's chamfer, outside it a relief step.
+    coin_width: u.mm # Seat band the ball coins into the cone, across it.
 
     # --- seals ---
     # Each slot is a Groove (sized by hand) or an AutoGroove (sized for its
@@ -84,15 +95,15 @@ class VentValve(System):
         lambda s, seat: {"ball.D": seat.D*SQRT2})
     # (Rounded to the pm, so round dimensions meet round limits.)
     seat_land = calc(u.mm, # Seat cone outside the bore, radially.
-        lambda s: round((s.seat.D - s.seat_bore.D)/2, 12))
+        lambda s: round((s.seat.D - s.choke.D)/2, 12))
     curtain_A = calc(u.mm2, # Past the lifted ball, as a frustum.
         lambda s: pi*(s.seat.D + s.stroke/2) * s.stroke/SQRT2)
     curtain_ratio = calc(u.none,
-        lambda s: s.curtain_A / s.seat_bore.A)
+        lambda s: s.curtain_A / s.choke.A)
     outlets_A = calc(u.mm2,
         lambda s: s.outlets * s.outlet.A)
     outlet_ratio = calc(u.none,
-        lambda s: s.outlets_A / s.seat_bore.A)
+        lambda s: s.outlets_A / s.choke.A)
     spring_inner_gap = calc(u.mm, # Spring ID over the shaft, radially.
         lambda s: round((s.spring.ID - s.shaft.D)/2, 12))
     spring_outer_gap = calc(u.mm, # Spring OD inside the piston bore, radially.
@@ -104,13 +115,13 @@ class VentValve(System):
     dP_pneumo = calc(u.bar,
         lambda s: s.P_pneumo - ATM)
     P_cavity = calc(u.bar, # Open: both restrictions choked.
-        lambda s: max(ATM, s.P_tank * s.seat_bore.A/s.outlets_A))
+        lambda s: max(ATM, s.P_tank * s.choke.A/s.outlets_A))
     @computed(u.N)
     def F_jet(s): # Open: the seat bore's jet, all turned by the ball. Choked
                   # thrust, or 2 dP A when nearly unchoked (-> 0 with dP).
         dP = s.P_tank - s.P_cavity
         return max(0.0, min(2*dP, THRUST*s.P_tank - s.P_cavity)) \
-                * s.seat_bore.A
+                * s.choke.A
     F_tank_closed = calc(u.N, # Inside the seat line.
         lambda s: s.dP_tank * s.seat.A)
     F_tank_open = calc(u.N, # Cavity over the shaft, and the jet.
@@ -123,6 +134,41 @@ class VentValve(System):
         lambda s: s.dP_pneumo * s.piston.A)
     F_spring_open = alias(u.N, "spring.F_long")
     F_spring_closed = alias(u.N, "spring.F_short")
+
+    # --- seat insert assembly and coining ---
+    interference = calc(u.mm, # Diametral.
+        lambda s: s.insert.D - s.pocket.D)
+    @computed(u.MPa)
+    def fit_pressure(s): # Lamé: a brass tube in a thick 6061 body.
+        d, di = s.insert.D, s.choke.D
+        C = ((1 + BODY[1])/BODY[0]
+             + ((d**2 + di**2)/(d**2 - di**2) - SEAT[1])/SEAT[0])
+        return max(0.0, s.interference)/(d*C)
+    land_width = calc(u.mm,
+        lambda s: round((s.land_OD.D - s.land_ID.D)/2, 12))
+    land_A = calc(u.mm2,
+        lambda s: s.land_OD.A - s.land_ID.A)
+    F_fit = calc(u.N, # Friction pressing it in; also what holds it.
+        lambda s: MU_PRESS*s.fit_pressure * pi*s.insert.D*s.insert_L)
+    F_land = calc(u.N, # Bottomed, to yield the land flat. (The floor, under
+                       # so narrow a land, holds ~3x its own yield.)
+        lambda s: BRASS_YIELD*s.land_A)
+    F_insert = calc(u.N, # Press force to assemble it.
+        lambda s: s.F_fit + s.F_land)
+    F_coin = calc(u.N, # Ball's axial load to coin the seat band: fully
+                       # plastic (~3x yield) across it, normal to the cone.
+        lambda s: 3*BRASS_YIELD*s.coin_width * s.seat.P/SQRT2)
+    @computed(u.bar)
+    def P_coin(s): # Supply to coin it with the piston, tank empty: against
+                   # the closed spring and breakaway friction (which grows
+                   # with the supply).
+        P = ATM
+        for _ in range(8):
+            P = ATM + (s.F_coin + s.F_spring_closed
+                       + friction(s.or_shaft, "breakaway", 0.0)
+                       + friction(s.or_piston, "breakaway", P - ATM)
+                       )/s.piston.A
+        return P
 
     # --- seals ---
     or_shaft = calc(RodSeal, # Shaft through the housing: cavity to dry side.
@@ -205,7 +251,7 @@ def venting(vv, V=u.L_(11), m0=u.kg_(8), T0=u.degC_(5), Cd=0.65,
     from scipy.integrate import solve_ivp
 
     N2O = np.vectorize(lambda *args: PropsSI(*args, "N2O"))
-    A = vv.seat_bore.A
+    A = vv.choke.A
 
     def mdot(P, rho):
         ratio = ATM / P
@@ -257,66 +303,26 @@ def build():
     mm = u.mm_
     return VentValve(**conditions(),
         ball=Circle(D=mm(5, tol=0.0025)),
-        seat_bore=Circle(D=mm(2, tol=(0, 0.05))),
+        choke=Circle(D=mm(2, tol=(0, 0.05))),
         outlet=Circle(D=mm(3, tol=(0, 0.1))), outlets=2,
-        shaft=Circle(D=mm(8.15, tol=(-0.028, -0.013))),
-        piston=Circle(D=mm(26, tol=(0, 0.05))),
+        shaft=Circle(D=mm(8.15, iso286="f7")),
+        piston=Circle(D=mm(26.0, iso286="H8")),
         spring=Spring(material="music wire", d=mm(2.5, tol=0.015),
                       D=mm(13, tol=0.15), n=5.25, L_free=mm(24.2, tol=0.4),
                       L_long=mm(20.3, tol=0.1), L_short=mm(19.3, tol=0.1)),
+        insert=Circle(D=mm(6.0, iso286="r6", centred=True)),
+        pocket=Circle(D=mm(6.0, iso286="H6", centred=True)),
+        # TODO: incorrect diameter assumed in F_fit or whatever. (ID of insert)
+        insert_L=mm(2, tol=0.15),
+        land_ID=Circle(D=mm(2.5, tol=0.05)),
+        land_OD=Circle(D=mm(3.1, tol=0.05)),
+        coin_width=mm(0.1),
         gr_shaft=Groove(oring=finer("mor8x1.5"),
                 root=mm(10.68, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
         gr_piston=Groove(oring=finer("mor23x1.5"),
                 root=mm(23.56, tol=0.05), Lz=mm(2.05, tol=0.1),
                 **opts_oring()),
     )
-
-def resizing(vv):
-    """ The piston seal re-sized whenever the piston bore changes. """
-    return vv.tweak(gr_piston=AutoGroove(**opts_oring()))
-
-def excess(s):
-    """ (opening, the tighter of closing and holding): each 3σ margin beyond
-    its requirement. """
-    return (corner("opening.margin")(s) - s.opening_min,
-            min(corner("closing.margin")(s) - s.closing_min,
-                corner("holding.margin")(s) - s.seat_load_min))
-
-def refit(vv, overrun=0.3):
-    """ vv with the spring's free length moved so `overrun` of its
-    deflection is left to solid, keeping its forces and rate. """
-    s = vv.spring
-    deflection = s.L_free - s.L_short
-    L_short = s.L_solid + overrun*deflection
-    return vv.tweak({"spring.L_free": L_short + deflection,
-                     "spring.L_short": L_short,
-                     "spring.L_long": L_short + float(s.travel)})
-
-def sized(vv, rounds=3, overrun=0.3):
-    """ vv with just enough spring preload to open, then just enough piston
-    to close and hold (each at its required 3σ margin), its piston seal
-    re-sized and its spring refitted. """
-    vv = resizing(vv)
-    for _ in range(rounds):
-        vv = vv.solve("F_spring_open", lambda s: excess(s)[0], 0.0)
-        vv = refit(vv, overrun)
-        vv = vv.solve("piston.D", lambda s: excess(s)[1], 0.0)
-    return vv
-
-def balanced(vv):
-    """ vv with the spring preload that leaves opening as much spare 3σ
-    margin as the tighter of closing and holding. """
-    return vv.solve("F_spring_open", lambda s: excess(s)[0] - excess(s)[1],
-                    0.0)
-
-def with_spring(vv, material, d, D, k, overrun=0.3):
-    """ vv with a spring of this wire, mean diameter and rate, preload
-    balanced, and `overrun` of its deflection left to solid. """
-    sp = vv.spring.tweak(dict(material=material, d=d, D=D))
-    vv = vv.tweak(spring=sp).tweak({"spring.k": k})
-    for _ in range(2):
-        vv = refit(balanced(vv), overrun)
-    return balanced(vv)
 
 
 def main():
@@ -325,57 +331,13 @@ def main():
     for seal in vv.seals():
         seal.outline(succinct=True)
     vv.verify().report()
+    print()
     for name in vv.balances:
         print(f"{name}: {vv.display(name + '.cases')}")
-
-
-def tolerances(vv):
-    """ What drives the opening and closing margins, and their worst builds. """
-    for name in ("opening.margin", "closing.margin"):
-        vv.variation(name).report()
-        vv.corners(name, check=5000, seed=1).report()
-        vv.corners(name, limits=True).report() # arithmetic worst
-
-
-def sweeps(vv):
-    """ The piston needed against the ice allowance (spring preload and piston
-    re-solved for each), and the 3σ margins against the outlet lines' size
-    (which sets the cavity pressure when open). """
-    rows = []
-    for F in u.N_(np.arange(0, 61, 10)):
-        s = sized(vv.tweak(F_ice=F))
-        rows.append([show(F, u.N), s.display("piston.D"),
-                     s.display("F_spring_open"), s.display("F_spring_closed")])
-    print("Ice allowance:\n" + table(rows, ["F_ice", "piston.D",
-            "F_spring_open", "F_spring_closed"]))
-    k3 = [corner(name + ".margin") for name in vv.balances]
-    sweep = vv.sweep("outlet.D", u.mm_(np.arange(1.5, 4.01, 0.25)), *k3,
-                     "P_cavity")
-    sweep.report()
-    sweep.plot()
-
-
-def springs(vv, options=(("music wire", 2.2, 10.5, 30),
-                          ("chrome silicon", 2.2, 10.5, 30),
-                          ("music wire", 2.2, 10.5, 45),
-                          ("302 stainless", 2.5, 10.5, 45))):
-    """ Springs for vv's piston: (material, d [mm], D [mm], k [N/mm]) each
-    with its preload balanced and 20% overrun to solid. Wire and coil
-    diameter follow from solid-safety and clearing the shaft; then the rate
-    trades length (low) against force tolerance (high). ~2 min each. """
-    rows = []
-    for material, d, D, k in options:
-        s = with_spring(vv, material, u.mm_(d), u.mm_(D), u.N_mm_(k),
-                        overrun=0.2)
-        v, sp = s.verify(), s.spring
-        r = {m.name.split(" ")[0]: x for m, (_, _, x) in v.results.items()}
-        rows.append([material, f"{d:g}", f"{D:g}", f"{k:g}", f"{sp.n:.2f}",
-                     sp.display("L_free"), f"{sp.index:.2f}",
-                     f"{r['spring.solid_SF']:.2f}",
-                     *(show(r[f"{b}.margin"], u.N) for b in s.balances),
-                     "ok" if v.ok else "FAILS"])
-    print(table(rows, ["material", "d", "D", "k", "n", "L_free", "index",
-                       "solid SF", *s.balances, ""]))
+    print()
+    vv.extents("F_fit")
+    vv.extents("P_coin")
+    vv.extents("F_pneumo")
 
 
 if __name__ == "__main__":

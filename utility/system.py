@@ -590,6 +590,19 @@ class System:
                 iters, converged, check, worse, space.system.unassessed(),
                 space.evals)
 
+    def extents(self, name, k=3.0, limits=False, fmt=None, printed=True):
+        """ (min, max) of the given (dotted) parameter at `k` sigma, or with
+        every Tol at its limit, each at its worst Env corner. Printed in its
+        units. """
+        lo, hi = (corner(name, worst, k=k, limits=limits)(self)
+                  for worst in ("min", "max"))
+        if printed:
+            owner, leaf = self._resolve(name)
+            unit = type(owner).unit(leaf)
+            how = "limits" if limits else f"{k:g}σ"
+            print(f"{name} ({how}): {show(lo, unit, fmt)} to "
+                  f"{show(hi, unit, fmt)}")
+        return lo, hi
 
 
     ### EXPLORING ###############################################################
