@@ -166,8 +166,8 @@ def opts_oring():
     return dict(material="FKM", hardness=u.shoreA_(75, tol=5), lubricated=True)
 
 def conditions():
-    return dict(P_tank=u.bar_(55, env=(30, 75)),
-                P_pneumo=u.bar_(10, env=0),
+    return dict(P_tank=u.bar_(55, env=(40, 75)),
+                P_pneumo=u.bar_(10, env=(9, 11)),
                 gap=u.mm_(0.04))
 
 def build():
@@ -179,13 +179,13 @@ def build():
         sleeve_ds=Circle(D=mm(24, iso286="f7")), # H8 bore
         piston=Circle(D=mm(50, iso286="H8")), # f7 shaft
         gr_seat=Groove(oring=finer("mor18x2"),
-                root=mm(18.60, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
+                root=mm(18.70, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
         gr_us=Groove(oring=finer("mor26x1.5"),
-                root=mm(28.25, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
+                root=mm(28.15, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
         gr_ds=Groove(oring=finer("mor24x1.5"),
-                root=mm(26.45, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
+                root=mm(26.37, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
         gr_piston=Groove(oring=finer("mor46x2"),
-                root=mm(46.70, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
+                root=mm(46.65, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
     )
 
 
