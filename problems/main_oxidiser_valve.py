@@ -167,25 +167,25 @@ def opts_oring():
 
 def conditions():
     return dict(P_tank=u.bar_(55, env=(40, 75)),
-                P_pneumo=u.bar_(10, env=(9, 11)),
+                P_pneumo=u.bar_(20, env=(18,22)),
                 gap=u.mm_(0.04))
 
 def build():
     mm = u.mm_
     return MainOxidiserValve(**conditions(),
-        bore=Circle(D=mm(20, tol=0.1)),
-        seat=Circle(D=mm(21.8, iso286="H8")), # f7 shaft
-        sleeve_us=Circle(D=mm(25.8, iso286="f7")), # H8 bore
-        sleeve_ds=Circle(D=mm(24, iso286="f7")), # H8 bore
-        piston=Circle(D=mm(50, iso286="H8")), # f7 shaft
-        gr_seat=Groove(oring=finer("mor18x2"),
-                root=mm(18.70, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
-        gr_us=Groove(oring=finer("mor26x1.5"),
-                root=mm(28.15, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
-        gr_ds=Groove(oring=finer("mor24x1.5"),
-                root=mm(26.37, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
-        gr_piston=Groove(oring=finer("mor46x2"),
-                root=mm(46.65, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
+        bore=Circle(D=mm(20.72, iso286="H8")),
+        seat=Circle(D=mm(20.72, iso286="H8")),
+        sleeve_us=Circle(D=mm(28.625, iso286="f7")),
+        sleeve_ds=Circle(D=mm(23.8, iso286="f7")),
+        piston=Circle(D=mm(50.11, iso286="H8")),
+        gr_seat=Groove(oring=finer("BS017"),
+                root=mm(18.0, iso286="H9"), Lz=mm(2.65, tol=0.1), **opts_oring()),
+        gr_us=Groove(oring=finer("BS024"),
+                root=mm(31.425, iso286="H9"), Lz=mm(2.0, tol=0.1), **opts_oring()),
+        gr_ds=Groove(oring=finer("BS021"),
+                root=mm(26.65, iso286="H9"), Lz=mm(2.0, tol=0.1), **opts_oring()),
+        gr_piston=Groove(oring=finer("BS132"),
+                root=mm(45.75, iso286="H9"), Lz=mm(2.65, tol=0.1), **opts_oring()),
     )
 
 
