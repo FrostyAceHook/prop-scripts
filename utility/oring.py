@@ -744,10 +744,14 @@ class AutoGroove(System):
     squeeze: u.percent = 0.15
     gland_fill: u.percent = 0.7
     CS: u.mm = None # None: picked by the sliding diameter.
+    sizes: tuple = None
     friction_level: u.none = OringFriction.SPREAD
 
     def seal(self, kind, name, D, **conditions):
         """ An auto-sized `kind` seal (PistonSeal or RodSeal) sliding on `D`. """
+        if self.sizes is not None:
+            if "sizes" not in conditions:
+                conditions["sizes"] = self.sizes
         return kind.auto(name, D, self.squeeze, self.gland_fill, CS=self.CS,
                 material=self.material, hardness=self.hardness,
                 lubricated=self.lubricated, friction_level=self.friction_level,

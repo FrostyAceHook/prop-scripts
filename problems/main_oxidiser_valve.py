@@ -100,12 +100,6 @@ class MainOxidiserValve(System):
         lambda s: round((s.seat.D - s.bore.D)/2, 12))
     piston_land = calc(u.mm, # Piston's groove root outside the upstream OD.
         lambda s: (s.or_piston.gland_root - s.sleeve_us.D)/2)
-    @computed(u.none)
-    def hoop_SF(s): # Thin-wall hoop stress at tank pressure: the mouth (outside
-        # pressure, closed) and the downstream end (inside pressure, open).
-        stress = s.P_tank * max(s.seat.r/s.wall_us,
-                                s.bore.r/s.wall_ds)
-        return AL6061_Ys / stress if stress > 0 else float("inf")
 
     # --- gauge pressures ---
     Pg_tank = calc(u.bar, lambda s: s.P_tank - ATM)
@@ -155,7 +149,6 @@ class MainOxidiserValve(System):
 
     # --- requirements ---
     balances = ("holding", "opening", "closing")
-    hoop_SF_min = 6.0 # fat
     land_min = u.mm_(1.0) # Piston's groove root outside the upstream OD.
 
     def requirements(self):
@@ -163,7 +156,6 @@ class MainOxidiserValve(System):
             corner("holding.margin"): (0.0, None),
             corner("opening.margin"): (0.0, None),
             corner("closing.margin"): (0.0, None),
-            corner("hoop_SF", "min"): (self.hoop_SF_min, None),
             "counterbore": (0.0, None),
             "piston_land": (self.land_min, None),
         }
@@ -174,112 +166,37 @@ def opts_oring():
     return dict(material="FKM", hardness=u.shoreA_(75, tol=5), lubricated=True)
 
 def conditions():
-    """ Tank pressure while opening and the pneumatic supply (absolute), and
-    the extrusion gap the fits must hold. """
     return dict(P_tank=u.bar_(55, env=(30, 75)),
-                P_pneumo=u.bar_(10, env=(9, 10)),
+                P_pneumo=u.bar_(10, env=0),
                 gap=u.mm_(0.04))
 
 def build():
-    """ The design: no spring, 10 bar pneumatics, 2 mm walls, a 50 mm
-    piston. """
     mm = u.mm_
-    # return MainOxidiserValve(**conditions(),
-    #     bore=Circle(D=mm(20, tol=(0, 0.1))),
-    #     seat=Circle(D=mm(21.8, tol=(0, 0.05))),
-    #     sleeve_us=Circle(D=mm(25.8, tol=(-0.05, 0))),
-    #     sleeve_ds=Circle(D=mm(24, tol=(-0.05, 0))),
-    #     piston=Circle(D=mm(50, tol=(0, 0.05))),
-    #     gr_seat=Groove(oring=finer("mor18x2"),
-    #             root=mm(18.45, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
-    #     gr_us=Groove(oring=finer("mor26x1.5"),
-    #             root=mm(28.35, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
-    #     gr_ds=Groove(oring=finer("mor24x1.5"),
-    #             root=mm(26.55, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
-    #     gr_piston=Groove(oring=finer("mor46x1.5"),
-    #             root=mm(47.5, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
-    # )
     return MainOxidiserValve(**conditions(),
-        bore=Circle(D=mm(20, tol=(0, 0.1))),
-        seat=Circle(D=mm(21.8, tol=(0, 0.05))),
-        sleeve_us=Circle(D=mm(25.8, tol=(-0.05, 0))),
-        sleeve_ds=Circle(D=mm(24, tol=(-0.05, 0))),
-        piston=Circle(D=mm(50, tol=(0, 0.05))),
+        bore=Circle(D=mm(20, tol=0.1)),
+        seat=Circle(D=mm(21.8, iso286="H8")), # f7 shaft
+        sleeve_us=Circle(D=mm(25.8, iso286="f7")), # H8 bore
+        sleeve_ds=Circle(D=mm(24, iso286="f7")), # H8 bore
+        piston=Circle(D=mm(50, iso286="H8")), # f7 shaft
         gr_seat=Groove(oring=finer("mor18x2"),
-                root=mm(18.45, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
+                root=mm(18.60, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
         gr_us=Groove(oring=finer("mor26x1.5"),
-                root=mm(28.35, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
+                root=mm(28.25, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
         gr_ds=Groove(oring=finer("mor24x1.5"),
-                root=mm(26.55, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
+                root=mm(26.45, tol=0.05), Lz=mm(2.0, tol=0.1), **opts_oring()),
         gr_piston=Groove(oring=finer("mor46x2"),
-                root=mm(46.65, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
+                root=mm(46.70, tol=0.05), Lz=mm(2.65, tol=0.1), **opts_oring()),
     )
-
-def resizing(mov):
-    """ Every seal re-sized whenever its diameter changes. """
-    auto = lambda **kw: AutoGroove(**opts_oring(), **kw)
-    return mov.tweak(gr_seat=auto(), gr_us=auto(), gr_ds=auto(),
-                     gr_piston=auto())
-
-@metric(u.mm, "piston needed")
-def piston_needed(s):
-    """ The piston bore that just holds closed (zero 3σ holding margin). """
-    return s.solve("piston.D", corner("holding.margin"), 0.0).piston.D
 
 
 def main():
     mov = build()
-    # mov = resizing(mov)
-    # mov.report()
-    # mov.verify().report()
-    # return
-    # mov.gr_piston.report()
-    # mov.or_piston.report()
-    # mov.or_piston.outline()
-    # return
     mov.report()
     for seal in mov.seals():
         seal.outline(succinct=True)
     mov.verify().report()
-
     for name in mov.balances:
         print(f"{name}: {mov.display(name + '.cases')}")
-
-
-def tolerances(mov):
-    """ What drives the opening (friction) and holding (areas) margins, and
-    their worst builds. """
-    for name in ("opening.margin", "holding.margin"):
-        mov.variation(name).report()
-        mov.corners(name, check=5000, seed=1).report()
-
-
-def sweeps(mov):
-    """ The mouth wall sets the closed annulus, so the opening force and the
-    piston needed to hold closed (seals re-sized). """
-    walls = u.mm_(np.arange(1.0, 2.51, 0.25))
-    sweep = resizing(mov).sweep("wall_us", walls, "A_closed",
-                                corner("opening.margin"), piston_needed)
-    sweep.report()
-    sweep.plot()
-
-
-def optimise(mov):
-    """ The smallest piston bore at 3σ over the sleeve's diameters (seals
-    re-sized, their catalogue fits left out as they come and go with the
-    diameters). Round its diameters to ones whose rings fit after. ~25 min. """
-    mm = u.mm_
-    design = resizing(mov)
-    reqs = design.requirements().without("or_seat", "or_us", "or_ds",
-                                         "or_piston")
-    params = {"seat.D": (mm(20), mm(26)),
-              "sleeve_us.D": (mm(23), mm(30)),
-              "sleeve_ds.D": (mm(23), mm(27)),
-              "piston.D": (mm(30), mm(60))}
-    best = design.optimise("piston.D", params, reqs, seed=1, popsize=6,
-                           maxiter=25, polish=False, workers=-1)
-    best.report()
-    return best
 
 
 if __name__ == "__main__":

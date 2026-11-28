@@ -92,6 +92,7 @@ from spec import Spread, Tol, Env, Bare, unit_obj_of, show, table, style_ax
 __all__ = (
     "System",
     "output",
+    "alias",
     "computed",
     "calc",
     "derived",
@@ -590,7 +591,7 @@ class System:
                 iters, converged, check, worse, space.system.unassessed(),
                 space.evals)
 
-    def extents(self, name, k=3.0, limits=False, fmt=None, printed=True):
+    def extents(self, name, k=3.0, limits=False, fmt=None, printed=False):
         """ (min, max) of the given (dotted) parameter at `k` sigma, or with
         every Tol at its limit, each at its worst Env corner. Printed in its
         units. """
@@ -1143,7 +1144,8 @@ def _sigma(system, m, lo, hi):
         return math.nan
     gap, reach = c.middle - bound, c.middle - c.value
     if reach == 0: # insensitive to every Tol
-        meets = gap >= 0 if m.worst == "min" else gap <= 0
+        slack = BOUND_SLACK * (abs(bound) or 1.0)
+        meets = gap >= -slack if m.worst == "min" else gap <= slack
         return math.inf if meets else -math.inf
     return c.k * gap / reach - c.k
 
@@ -1291,8 +1293,13 @@ def _constraint_table(system, constraints, header="constraint", notes=None):
     return table(rows, [header, "value", "required", ""]
                  + (["σ margin"] if notes else []))
 
+# Relative slack at a bound (absolute, in SI, at a bound of 0): float noise in a
+# derived value (~1e-16 relative) mustn't fail a design that's on its limit.
+BOUND_SLACK = 1e-9
+
 def _violation(lo, hi, value):
-    """ Total relative violation of lo <= value <= hi (0 if satisfied). """
+    """ Total relative violation of lo <= value <= hi (0 if satisfied, or
+    within BOUND_SLACK). """
     if not math.isfinite(value):
         return 1e3
     v = 0.0
@@ -1300,7 +1307,7 @@ def _violation(lo, hi, value):
         v += (lo - value) / (abs(lo) or 1.0)
     if hi is not None and value > hi:
         v += (value - hi) / (abs(hi) or 1.0)
-    return v
+    return v if v > BOUND_SLACK else 0.0
 
 def _assess(system, metric, constraints, sign):
     """ Score for minimisation: sign*metric if feasible, else _INFEASIBLE

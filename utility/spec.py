@@ -127,13 +127,17 @@ class Converter:
     """
     __slots__ = ("unit",)
 
-    def __init__(self, alias):
-        self.unit = unit_obj_of(alias)
-        if self.unit is None:
-            raise TypeError(f"{alias!r} has no Unit")
+    def __init__(self, alias=None):
+        if alias is None:
+            self.unit = None
+        else:
+            self.unit = unit_obj_of(alias)
+            if self.unit is None:
+                raise TypeError(f"{alias!r} has no Unit")
 
     def __call__(self, *args, **kwargs):
-        return self.unit.to_si(*args, **kwargs)
+        unit = self.unit or Unit("")
+        return unit.to_si(*args, **kwargs)
 
     def from_si(self, si):
         return self.unit.from_si(si)
@@ -550,6 +554,7 @@ _ABSZ = 273.15
 
 # Dimensionless.
 none = Annotated[_Float, None]
+none_ = Converter()
 percent = Annotated[_Float, Unit("%", 1e-2, spaced=False)]
 percent_ = Converter(percent)
 

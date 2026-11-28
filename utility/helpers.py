@@ -1,4 +1,5 @@
 import math
+import itertools
 from math import sqrt, pi
 
 import spec as u
@@ -14,6 +15,9 @@ __all__ = (
     "reseal",
     "seal_options",
     "Circle",
+    "Annulus",
+    "ThickWall",
+    "AL6061_T6",
     "Balance",
     "Spring",
 )
@@ -104,7 +108,144 @@ class Circle(System):
     D: u.mm
     r = derived(u.mm, "D", lambda D: D/2, lambda r: 2*r)
     A = derived(u.mm2, "D", lambda D: pi/4*D**2, lambda A: sqrt(A*4/pi))
-    P = derived(u.mm, "D", lambda D: pi*D, lambda P: D/pi)
+    p = derived(u.mm, "D", lambda D: pi*D, lambda p: p/pi)
+
+
+class Annulus(System):
+    """ Inner + outer circle. Defined by two of ID, OD and th (not all three).
+    Annulus(...) builds the matching form: AnnulusIDOD, AnnulusIDth or
+    AnnulusODth. """
+
+    def __new__(cls, *args, **given):
+        if cls is not Annulus:
+            return super().__new__(cls)
+        if args:
+            raise TypeError("need keywords only: two of ID=, OD=, and th=")
+        form = _ANNULUS_FORMS.get(frozenset(given))
+        if form is None:
+            raise TypeError("need exactly two of ID=, OD=, and th=, got "
+                            f"{', '.join(given) or 'none'}")
+        if any(v is None for v in given.values()):
+            raise TypeError("dimensions can't be None")
+        return super().__new__(form)
+
+    def __post_init__(self):
+        if not (self.ID > 0 and self.th > 0):
+            raise ValueError(f"need 0 < ID < OD (ID {self.ID}, OD {self.OD} m)")
+
+    Ir = calc(u.mm, lambda s: s.ID/2)
+    Or = calc(u.mm, lambda s: s.OD/2)
+    A = calc(u.mm2, lambda s: pi/4*(s.OD**2 - s.ID**2))
+    Ip = calc(u.mm, lambda s: pi*s.ID)
+    Op = calc(u.mm, lambda s: pi*s.OD)
+
+    inner = calc(Circle, lambda s: Circle(D=s.ID))
+    outer = calc(Circle, lambda s: Circle(D=s.OD))
+
+class AnnulusIDOD(Annulus, kw_only=True):
+    """ Defined by ID and OD. Setting thickness keeps the ID. """
+    ID: u.mm
+    OD: u.mm
+    th = calc(u.mm, lambda s: (s.OD - s.ID)/2,
+              lambda s, th: dict(OD=s.ID + 2*th))
+
+class AnnulusIDth(Annulus, kw_only=True):
+    """ Defined by ID and thickness. Setting OD keeps the ID. """
+    ID: u.mm
+    th: u.mm
+    OD = calc(u.mm, lambda s: s.ID + 2*s.th,
+              lambda s, OD: dict(th=(OD - s.ID)/2))
+
+class AnnulusODth(Annulus, kw_only=True):
+    """ Defined by OD and thickness. Setting ID keeps the OD. """
+    OD: u.mm
+    th: u.mm
+    ID = calc(u.mm, lambda s: s.OD - 2*s.th,
+              lambda s, ID: dict(th=(s.OD - ID)/2))
+
+_ANNULUS_FORMS = {frozenset(("ID", "OD")): AnnulusIDOD,
+                  frozenset(("ID", "th")): AnnulusIDth,
+                  frozenset(("OD", "th")): AnnulusODth}
+
+
+
+
+# 6061-T6: Young's modulus, Poisson's ratio, 0.2% yield and ultimate [Pa].
+AL6061_T6 = dict(E=68.9e9, nu=0.33, Ys=276e6, Us=310e6)
+
+class ThickWall(System):
+    """
+    A thick-walled (Lamé) cylinder under internal and external pressure. Stresses
+    are at the internal wall, where they all peak. `ends`:
+      "open"    no axial loading.
+      "closed"  full axial loading from the pressure.
+      "plane"   held axially: plane strain
+    """
+    wall: Annulus
+    E: u.MPa # Young's modulus.
+    nu: u.none # Poisson's ratio.
+    Ys: u.MPa # Yield strength.
+    Us: u.MPa # Ultimate strength.
+    Pi: u.bar # internal pressure.
+    Po: u.bar = ATM # external pressure.
+    ends: str = "closed"
+
+    def __post_init__(self):
+        if self.ends not in ("closed", "open", "plane"):
+            raise ValueError(f"ends is 'closed', 'open' or 'plane', not "
+                             f"{self.ends!r}")
+
+    def stresses(self, r, Pi=None):
+        """ (hoop, radial, axial) at radius `r` with internal pressure `P`. """
+        p_i = (self.Pi if Pi is None else Pi) - ATM
+        p_o = self.Po - ATM
+        ri, ro = self.wall.Ir, self.wall.Or
+        k = ro**2 - ri**2
+        A = (p_i*ri**2 - p_o*ro**2)/k
+        B = (p_i - p_o)*ri**2*ro**2/k
+        axial = {"closed": A, "open": 0.0, "plane": 2*self.nu*A}[self.ends]
+        return A + B/r**2, A - B/r**2, axial
+
+    def _vm(self, r, Pi=None):
+        h, rd, a = self.stresses(r, Pi)
+        return sqrt(((h - rd)**2 + (rd - a)**2 + (a - h)**2)/2)
+
+    dP = calc(u.bar, lambda s: s.Pi - s.Po)
+    hoop = calc(u.MPa, lambda s: s.stresses(s.wall.Ir)[0])
+    radial = calc(u.MPa, lambda s: s.stresses(s.wall.Ir)[1])
+    axial = calc(u.MPa, lambda s: s.stresses(s.wall.Ir)[2])
+    vm = calc(u.MPa, lambda s: s._vm(s.wall.Ir)) # von Mises.
+    tresca = calc(u.MPa, # Stress intensity: twice the max shear.
+        lambda s: max(abs(a - b) for a, b in itertools.combinations(
+            s.stresses(s.wall.Ir), 2)))
+    SF = calc(u.none, # On yield, by von Mises.
+        lambda s: s.Ys/s.vm if s.vm else math.inf)
+
+    @computed(u.bar)
+    def Pi_yield(s): # Internal pressure (absolute) that first yields the bore.
+        # The stresses are linear in it, so von Mises^2 is quadratic in it.
+        f = lambda P: s._vm(s.wall.Ir, P)**2
+        Po = s.Po
+        c, a_b, b_a = f(Po), f(Po + 1e6), f(Po - 1e6)
+        a = (a_b + b_a - 2*c)/2e12
+        b = (a_b - b_a)/2e6
+        c -= s.Ys**2
+        return Po + (-b + sqrt(b*b - 4*a*c))/(2*a)
+
+    Pi_burst = calc(u.bar, # Faupel's burst pressure (absolute), closed ends.
+        lambda s: s.Po + 2/sqrt(3)*s.Ys*(2 - s.Ys/s.Us)
+                  * math.log(s.wall.Or/s.wall.Ir))
+
+    @computed(u.um)
+    def dID(s): # Bore growth (diametral), as felt by a seal in it.
+        h, rd, a = s.stresses(s.wall.Ir)
+        return 2*s.wall.Ir*(h - s.nu*(rd + a))/s.E
+
+    @computed(u.um)
+    def dOD(s): # Outside diameter growth.
+        h, rd, a = s.stresses(s.wall.Or)
+        return 2*s.wall.Or*(h - s.nu*(rd + a))/s.E
+
 
 
 
